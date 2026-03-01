@@ -15,6 +15,27 @@ Built with **Tauri 2** (Rust backend) + **React** (frontend). Runs natively on m
 - Step history is passed between iterations so the agent remembers what it already did.
 - Configurable confidence threshold — low-confidence actions are rejected automatically.
 
+### Click Accuracy Pipeline
+
+Every click goes through a multi-stage precision pipeline:
+
+1. **Normalized coordinates** — the vision model returns `x_norm` / `y_norm` in a `[0, 1000]` space relative to the screenshot, eliminating resolution dependency.
+2. **Scale-factor-aware conversion** — coordinates are translated from screenshot pixels → macOS logical points, accounting for Retina scaling (`2.0x`, `3.0x`) and multi-monitor offsets.
+3. **Confidence gating** — each action carries a `confidence` score (0–1). Clicks below the threshold (default `0.60`, configurable via `AGENT_CONFIDENCE_THRESHOLD`) are **automatically rejected** before the mouse moves.
+4. **Adaptive resolution** — screenshots are downscaled to `AGENT_INFER_MAX_DIM` (default `960px`) before sending to the model, balancing accuracy vs. inference speed.
+5. **Visual verification** — the transparent overlay shows a pulsing cursor at the exact click target before actuation, so you can visually confirm accuracy.
+
+### Hotkey-First Navigation
+
+The agent is trained to **prefer keyboard shortcuts over clicking** whenever possible. The system prompt includes a comprehensive hotkey reference:
+
+- **Browser** — Cmd+T (new tab), Cmd+W (close), Cmd+L (address bar), Cmd+Shift+T (reopen), Cmd+R (reload), tab switching, and more.
+- **macOS** — Spotlight, app switching, clipboard, undo/redo, screenshots, fullscreen.
+- **Finder** — Go to path, show hidden files, trash.
+- **Terminal** — Interrupt, line navigation.
+
+This makes the agent significantly faster and more reliable — opening a new Chrome tab via `Cmd+T` instead of hunting for the `+` button.
+
 ### Floating HUD (Always-On-Top)
 
 A compact, transparent pill that floats above everything — your command center without leaving your workflow.
@@ -29,7 +50,8 @@ A compact, transparent pill that floats above everything — your command center
 | ◄ Collapse | Shrink HUD to a single circle, click to expand  |
 
 - **Elapsed timer** shows a running clock (▶ 0:05) during agent runs and (● 0:12) during recording.
-- **Activity feed** shows HH:MM:SS timestamps on every step.
+- **Activity feed** shows HH:MM:SS timestamps on every step — **auto-opens when the agent starts a task**.
+- **Blue glow border** pulses around the entire screen while the agent is actively running, providing a clear visual indicator of AI control.
 - Collapsible to a 40px circle centered on screen.
 
 ### Session Recording & Replay
@@ -56,6 +78,7 @@ Record yourself performing a task — the AI watches, learns, and can repeat it.
 
 - Full-screen transparent window spanning all monitors.
 - Visual cursor shows exactly where the agent plans to click — with pulse animations.
+- **Blue glow border** — pulsing blue border around the entire screen while the agent is in control, fades out 2 seconds after completion.
 - Target icon in HUD: default color when active, red when disabled.
 
 ### Safety Controls
