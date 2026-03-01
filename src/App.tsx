@@ -10,7 +10,7 @@ import {
 } from "@tauri-apps/api/window";
 import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
 
-type Tab = "run" | "sessions" | "diagnostics";
+type Tab = "run" | "sessions" | "dev";
 
 type PermissionState = {
   screen_recording: boolean;
@@ -46,13 +46,20 @@ type CaptureFrame = {
   capture_ms: number;
 };
 
+type KeyAction = {
+  key: string;
+  direction?: "press" | "release" | "click";
+};
+
 type VisionAction = {
-  action: "click" | "none";
+  action: "click" | "hotkey" | "type" | "none";
   x_norm: number;
   y_norm: number;
   confidence: number;
   reason: string;
   model_ms: number;
+  keys?: KeyAction[];
+  text?: string;
 };
 
 type RecordingStatus = {
@@ -109,14 +116,21 @@ type HudActionError = {
   message: string;
 };
 
+type AgentStep = {
+  phase: "capture" | "thinking" | "click" | "hotkey" | "type" | "done" | "error";
+  step: number;
+  max_steps: number;
+  message: string;
+};
+
 const OVERLAY_LABEL = "overlay";
 const OVERLAY_QUERY_KEY = "overlay";
 const HUD_LABEL = "hud";
 const HUD_QUERY_KEY = "hud";
 const MAIN_LABEL = "main";
 const DEFAULT_HUD_MODEL = "mistralai/ministral-14b-2512";
-const HUD_WIDTH = 330;
-const HUD_HEIGHT = 44;
+const HUD_WIDTH = 460;
+const HUD_HEIGHT = 48;
 
 const FLOW = [
   "UI calls `capture_primary_cmd`; Rust captures the primary display and writes a PNG in temp storage.",
@@ -230,7 +244,7 @@ async function ensureHudWindow(): Promise<WebviewWindow> {
     await win.setMinSize(new LogicalSize(width, height)).catch(() => undefined);
     await win.show();
     await win.setAlwaysOnTop(true);
-    await win.setFocusable(true);
+    await win.setFocusable(false);
     await win
       .setBackgroundColor({ red: 0, green: 0, blue: 0, alpha: 0 })
       .catch(() => undefined);
@@ -393,6 +407,8 @@ function HudWindow() {
     stop: false,
     run: false,
   });
+  const loopStopRef = useRef(false);
+  const [looping, setLooping] = useState(false);
 
   const refreshRecordingState = async () => {
     try {
@@ -494,28 +510,87 @@ function HudWindow() {
         },
       });
 
-      if (inferred.action !== "click") {
+      if (inferred.action === "click") {
+        await invoke("execute_real_click_cmd", {
+          req: {
+            x_norm: inferred.x_norm,
+            y_norm: inferred.y_norm,
+            screenshot_w_px: captured.screenshot_w_px,
+            screenshot_h_px: captured.screenshot_h_px,
+            monitor_origin_x_pt: captured.monitor_origin_x_pt,
+            monitor_origin_y_pt: captured.monitor_origin_y_pt,
+            scale_factor: captured.scale_factor,
+            confidence: inferred.confidence,
+          },
+        });
+      } else if (inferred.action === "hotkey" && inferred.keys?.length) {
+        await invoke("press_keys_cmd", {
+          req: { keys: inferred.keys, delay_ms: 30 },
+        });
+      } else if (inferred.action === "type" && inferred.text) {
+        await invoke("type_text_cmd", { text: inferred.text });
+      } else {
         return;
       }
-
-      await invoke("execute_real_click_cmd", {
-        req: {
-          x_norm: inferred.x_norm,
-          y_norm: inferred.y_norm,
-          screenshot_w_px: captured.screenshot_w_px,
-          screenshot_h_px: captured.screenshot_h_px,
-          monitor_origin_x_pt: captured.monitor_origin_x_pt,
-          monitor_origin_y_pt: captured.monitor_origin_y_pt,
-          scale_factor: captured.scale_factor,
-          confidence: inferred.confidence,
-        },
-      });
     } catch (err) {
       await emit("hud_action_error", {
         action: "run_once",
         message: String(err),
       } satisfies HudActionError).catch(() => undefined);
     } finally {
+      setBusy((b) => ({ ...b, run: false }));
+    }
+  };
+
+  const runAgentLoopFromHud = async () => {
+    loopStopRef.current = false;
+    setLooping(true);
+    setBusy((b) => ({ ...b, run: true }));
+    const MAX_STEPS = 30;
+    try {
+      for (let step = 1; step <= MAX_STEPS; step++) {
+        if (loopStopRef.current) break;
+
+        const captured = await invoke<CaptureFrame>("capture_primary_cmd");
+        const inferred = await invoke<VisionAction>("infer_click_cmd", {
+          req: {
+            png_path: captured.png_path,
+            instruction: status.instruction || "Click the target button",
+            model: DEFAULT_HUD_MODEL,
+          },
+        });
+
+        if (inferred.action === "none" || loopStopRef.current) break;
+
+        if (inferred.action === "click") {
+          await invoke("execute_real_click_cmd", {
+            req: {
+              x_norm: inferred.x_norm,
+              y_norm: inferred.y_norm,
+              screenshot_w_px: captured.screenshot_w_px,
+              screenshot_h_px: captured.screenshot_h_px,
+              monitor_origin_x_pt: captured.monitor_origin_x_pt,
+              monitor_origin_y_pt: captured.monitor_origin_y_pt,
+              scale_factor: captured.scale_factor,
+              confidence: inferred.confidence,
+            },
+          });
+        } else if (inferred.action === "hotkey" && inferred.keys?.length) {
+          await invoke("press_keys_cmd", {
+            req: { keys: inferred.keys, delay_ms: 30 },
+          });
+        }
+
+        // Brief pause between steps to let the UI settle
+        await new Promise((r) => setTimeout(r, 800));
+      }
+    } catch (err) {
+      await emit("hud_action_error", {
+        action: "agent_loop",
+        message: String(err),
+      } satisfies HudActionError).catch(() => undefined);
+    } finally {
+      setLooping(false);
       setBusy((b) => ({ ...b, run: false }));
     }
   };
@@ -547,27 +622,203 @@ function HudWindow() {
   };
 
   const openMainFromHud = async () => {
-    const ok = await revealMainWindow();
-    if (!ok) {
+    const main = await WebviewWindow.getByLabel(MAIN_LABEL);
+    if (!main) {
       await emit("hud_action_error", {
         action: "open_main",
         message: "Main window not found (label=main)",
       } satisfies HudActionError).catch(() => undefined);
+      return;
+    }
+    const visible = await main.isVisible().catch(() => false);
+    if (visible) {
+      await main.hide().catch(() => undefined);
+    } else {
+      await revealMainWindow();
+    }
+  };
+
+  const suppressDashboard = () => {
+    void (async () => {
+      const main = await WebviewWindow.getByLabel(MAIN_LABEL);
+      if (main) await main.hide().catch(() => undefined);
+    })();
+  };
+
+  const [hudHoverOnly, setHudHoverOnly] = useState(false);
+  const [hudCollapsed, setHudCollapsed] = useState(false);
+
+  const [hudPanel, setHudPanel] = useState<"none" | "activity" | "command">("none");
+  const [activityFeed, setActivityFeed] = useState<AgentStep[]>([]);
+  const [hudInstruction, setHudInstruction] = useState("");
+  const [hudContext, setHudContext] = useState("");
+  const activityEndRef = useRef<HTMLDivElement>(null);
+
+  const pushActivity = (step: AgentStep) => {
+    setActivityFeed((f) => [...f.slice(-30), step]);
+    setTimeout(() => activityEndRef.current?.scrollIntoView({ behavior: "smooth" }), 50);
+  };
+
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    void (async () => {
+      unlisten = await listen<AgentStep>("agent_step", ({ payload }) => {
+        pushActivity(payload);
+      });
+    })();
+    return () => { if (unlisten) unlisten(); };
+  }, []);
+
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    void (async () => {
+      unlisten = await listen<boolean>("hud_hover_mode", ({ payload }) => {
+        setHudHoverOnly(payload);
+      });
+    })();
+    return () => { if (unlisten) unlisten(); };
+  }, []);
+
+  const togglePanel = async (panel: "activity" | "command") => {
+    const win = getCurrentWindow();
+    if (hudPanel === panel) {
+      setHudPanel("none");
+      await win.setFocusable(false).catch(() => undefined);
+      await win.setSize(new LogicalSize(HUD_WIDTH, HUD_HEIGHT)).catch(() => undefined);
+      await win.setMaxSize(new LogicalSize(HUD_WIDTH, HUD_HEIGHT)).catch(() => undefined);
+      await win.setMinSize(new LogicalSize(HUD_WIDTH, HUD_HEIGHT)).catch(() => undefined);
+    } else {
+      setHudPanel(panel);
+      const h = panel === "activity" ? 180 : 200;
+      await win.setFocusable(panel === "command").catch(() => undefined);
+      await win.setMinSize(new LogicalSize(HUD_WIDTH, h)).catch(() => undefined);
+      await win.setMaxSize(new LogicalSize(HUD_WIDTH, h)).catch(() => undefined);
+      await win.setSize(new LogicalSize(HUD_WIDTH, h)).catch(() => undefined);
+    }
+  };
+
+  const runAgentLoopFromHudWithTracking = async () => {
+    loopStopRef.current = false;
+    setLooping(true);
+    setBusy((b) => ({ ...b, run: true }));
+    const MAX_STEPS = 30;
+    const inst = hudInstruction || status.instruction || "Click the target button";
+    const stepHistory: string[] = [];
+    try {
+      for (let step = 1; step <= MAX_STEPS; step++) {
+        if (loopStopRef.current) break;
+
+        const captureStep: AgentStep = { phase: "capture", step, max_steps: MAX_STEPS, message: "Capturing screen..." };
+        await emit("agent_step", captureStep).catch(() => undefined);
+
+        const captured = await invoke<CaptureFrame>("capture_primary_cmd");
+
+        const thinkStep: AgentStep = { phase: "thinking", step, max_steps: MAX_STEPS, message: "Model is thinking..." };
+        await emit("agent_step", thinkStep).catch(() => undefined);
+
+        const inferred = await invoke<VisionAction>("infer_click_cmd", {
+          req: {
+            png_path: captured.png_path,
+            instruction: inst,
+            model: DEFAULT_HUD_MODEL,
+            step_context: stepHistory.length > 0 ? stepHistory.join("\n") : undefined,
+          },
+        });
+
+        if (inferred.action === "none" || loopStopRef.current) {
+          const doneStep: AgentStep = { phase: "done", step, max_steps: MAX_STEPS, message: inferred.reason };
+          await emit("agent_step", doneStep).catch(() => undefined);
+          break;
+        }
+
+        if (inferred.action === "click") {
+          await invoke("execute_real_click_cmd", {
+            req: {
+              x_norm: inferred.x_norm, y_norm: inferred.y_norm,
+              screenshot_w_px: captured.screenshot_w_px, screenshot_h_px: captured.screenshot_h_px,
+              monitor_origin_x_pt: captured.monitor_origin_x_pt, monitor_origin_y_pt: captured.monitor_origin_y_pt,
+              scale_factor: captured.scale_factor, confidence: inferred.confidence,
+            },
+          });
+          stepHistory.push(`Step ${step}: clicked at (${inferred.x_norm}, ${inferred.y_norm}) — ${inferred.reason}`);
+          const s: AgentStep = { phase: "click", step, max_steps: MAX_STEPS, message: inferred.reason };
+          await emit("agent_step", s).catch(() => undefined);
+        } else if (inferred.action === "hotkey" && inferred.keys?.length) {
+          await invoke("press_keys_cmd", { req: { keys: inferred.keys, delay_ms: 30 } });
+          const keyDesc = inferred.keys.map((k) => k.key).join("+");
+          stepHistory.push(`Step ${step}: hotkey ${keyDesc} — ${inferred.reason}`);
+          const s: AgentStep = { phase: "hotkey", step, max_steps: MAX_STEPS, message: `${keyDesc} — ${inferred.reason}` };
+          await emit("agent_step", s).catch(() => undefined);
+        } else if (inferred.action === "type" && inferred.text) {
+          await invoke("type_text_cmd", { text: inferred.text });
+          stepHistory.push(`Step ${step}: typed "${inferred.text}" — ${inferred.reason}`);
+          const s: AgentStep = { phase: "type", step, max_steps: MAX_STEPS, message: `"${inferred.text}" — ${inferred.reason}` };
+          await emit("agent_step", s).catch(() => undefined);
+        }
+
+        await new Promise((r) => setTimeout(r, 800));
+      }
+    } catch (err) {
+      const errStep: AgentStep = { phase: "error", step: 0, max_steps: MAX_STEPS, message: String(err) };
+      await emit("agent_step", errStep).catch(() => undefined);
+    } finally {
+      setLooping(false);
+      setBusy((b) => ({ ...b, run: false }));
+    }
+  };
+
+  const toggleCollapse = async () => {
+    const win = getCurrentWindow();
+    const monitor = await currentMonitor();
+    const scale = monitor?.scaleFactor || 1;
+    const monX = monitor ? monitor.position.x / scale : 0;
+    const monW = monitor ? monitor.size.width / scale : 1400;
+    const monY = monitor ? monitor.position.y / scale : 0;
+    const next = !hudCollapsed;
+    setHudCollapsed(next);
+    if (next) {
+      setHudPanel("none");
+      const w = 48, h = 48;
+      await win.setMinSize(new LogicalSize(w, h)).catch(() => undefined);
+      await win.setMaxSize(new LogicalSize(w, h)).catch(() => undefined);
+      await win.setSize(new LogicalSize(w, h)).catch(() => undefined);
+      await win.setPosition(new LogicalPosition(monX + monW / 2 - w / 2, monY + 20)).catch(() => undefined);
+    } else {
+      await win.setMinSize(new LogicalSize(HUD_WIDTH, HUD_HEIGHT)).catch(() => undefined);
+      await win.setMaxSize(new LogicalSize(HUD_WIDTH, HUD_HEIGHT)).catch(() => undefined);
+      await win.setSize(new LogicalSize(HUD_WIDTH, HUD_HEIGHT)).catch(() => undefined);
+      await win.setPosition(new LogicalPosition(monX + monW / 2 - HUD_WIDTH / 2, monY + 20)).catch(() => undefined);
     }
   };
 
   return (
-    <main className="hud-root">
+    <main
+      className={`hud-root ${hudPanel !== "none" ? "hud-expanded" : ""} ${hudHoverOnly ? "hud-hover-only" : ""} ${hudCollapsed ? "hud-collapsed" : ""}`}
+      onClick={suppressDashboard}
+    >
       <section
-        className="hud-pill"
-        onDoubleClick={() => void openMainFromHud()}
-        title="Double-click to open Agenticify"
+        className={`hud-pill ${hudPanel !== "none" ? "expanded" : ""} ${hudCollapsed ? "collapsed" : ""}`}
+        onMouseDown={(e) => { if (!hudPanel || hudPanel !== "command") e.preventDefault(); }}
+        title={hudCollapsed ? "Click to expand" : "Agenticify HUD"}
       >
+        {hudCollapsed ? (
+          <button
+            className="hud-btn hud-btn-icon"
+            onClick={() => void toggleCollapse()}
+            title="Expand HUD"
+            type="button"
+          >
+            <svg viewBox="0 0 24 24" className="hud-icon" aria-hidden="true">
+              <path d="M9 18l6-6-6-6" />
+            </svg>
+          </button>
+        ) : (
+          <>
         <div className="hud-main">
           <div className="hud-controls">
             <button
               className="hud-btn hud-btn-icon"
-              onClick={() => void openMainFromHud()}
+              onClick={(e) => { e.stopPropagation(); void openMainFromHud(); }}
               title="Show main menu"
               aria-label="Show main menu"
               type="button"
@@ -579,117 +830,131 @@ function HudWindow() {
               </svg>
             </button>
             <button
-              className="hud-btn hud-btn-icon"
-              onClick={() => void startRecordingFromHud()}
-              disabled={recordingActive || busy.start}
-              title="Start recording full-screen frames"
-              aria-label="Start recording full-screen frames"
+              className={`hud-btn hud-btn-icon ${hudPanel === "command" ? "active" : ""}`}
+              onClick={(e) => { e.stopPropagation(); void togglePanel("command"); }}
+              title="Set instruction & run agent loop"
+              aria-label="Set instruction & run agent loop"
               type="button"
             >
               <svg viewBox="0 0 24 24" className="hud-icon" aria-hidden="true">
-                <circle
-                  cx="12"
-                  cy="12"
-                  r="5.5"
-                  fill="currentColor"
-                  stroke="none"
-                />
+                <path d="M12 20h9" />
+                <path d="M16.5 3.5a2.121 2.121 0 1 1 3 3L7 19l-4 1 1-4Z" />
               </svg>
             </button>
             <button
-              className="hud-btn hud-btn-icon"
-              onClick={() => void stopRecordingFromHud()}
-              disabled={!recordingActive || busy.stop}
-              title="Stop and save recording session"
-              aria-label="Stop and save recording session"
+              className={`hud-btn hud-btn-icon ${hudPanel === "activity" ? "active" : ""}`}
+              onClick={(e) => { e.stopPropagation(); void togglePanel("activity"); }}
+              title="Toggle model activity feed"
+              aria-label="Toggle model activity feed"
               type="button"
             >
               <svg viewBox="0 0 24 24" className="hud-icon" aria-hidden="true">
-                <rect
-                  x="7"
-                  y="7"
-                  width="10"
-                  height="10"
-                  rx="2"
-                  fill="currentColor"
-                  stroke="none"
-                />
+                <path d="M6 9l6 6 6-6" />
               </svg>
             </button>
             <button
-              className="hud-btn hud-btn-icon"
-              onClick={() => void runOneShotFromHud()}
-              disabled={busy.run}
-              title="Capture, infer target, and click once"
-              aria-label="Capture, infer target, and click once"
-              type="button"
-            >
-              <svg viewBox="0 0 24 24" className="hud-icon" aria-hidden="true">
-                <path
-                  d="M8 6.5L18 12L8 17.5V6.5z"
-                  fill="currentColor"
-                  stroke="none"
-                />
-              </svg>
-            </button>
-            <button
-              className={`hud-btn hud-btn-icon ${status.overlay ? "active" : ""}`}
-              onClick={() => void toggleOverlayFromHud()}
+              className={`hud-btn hud-btn-icon ${status.overlay ? "" : "overlay-off"}`}
+              onClick={(e) => { e.stopPropagation(); void toggleOverlayFromHud(); }}
               title="Toggle visual overlay cursor layer"
               aria-label="Toggle visual overlay cursor layer"
               type="button"
             >
               <svg viewBox="0 0 24 24" className="hud-icon" aria-hidden="true">
-                <path d="M2.5 12s3.5-6 9.5-6s9.5 6 9.5 6s-3.5 6-9.5 6s-9.5-6-9.5-6z" />
-                <circle cx="12" cy="12" r="2.8" />
-                {!status.overlay ? (
-                  <path d="M5 5l14 14" strokeWidth="2.2" />
-                ) : null}
+                <circle cx="12" cy="12" r="9" />
+                <circle cx="12" cy="12" r="4.5" />
+                <circle cx="12" cy="12" r="1.2" fill="currentColor" stroke="none" />
+                <path d="M12 2v4" />
+                <path d="M12 18v4" />
+                <path d="M2 12h4" />
+                <path d="M18 12h4" />
               </svg>
             </button>
           </div>
           <div className="hud-right">
+            {looping && (
+              <button
+                className="hud-btn"
+                onClick={(e) => { e.stopPropagation(); loopStopRef.current = true; }}
+                title="Stop agent loop"
+                style={{ fontSize: "0.5rem", padding: "2px 5px" }}
+              >
+                STOP
+              </button>
+            )}
             <span
               className={`hud-state ${recordingActive ? "ok" : "bad"}`}
-              title={
-                recordingActive
-                  ? `Recording (${recordingTicks} ticks)`
-                  : "Recording idle"
-              }
-              aria-label={
-                recordingActive
-                  ? `Recording (${recordingTicks} ticks)`
-                  : "Recording idle"
-              }
+              title={recordingActive ? `Recording (${recordingTicks} ticks)` : "Recording idle"}
             >
               {recordingActive ? "REC" : "IDLE"}
             </span>
             <span
               className={`hud-state ${status.permsReady && status.keyLoaded ? "ok" : "bad"}`}
-              title={
-                status.permsReady && status.keyLoaded
-                  ? "Permissions and API key ready"
-                  : "Permissions/API key missing"
-              }
-              aria-label={
-                status.permsReady && status.keyLoaded
-                  ? "Permissions and API key ready"
-                  : "Permissions/API key missing"
-              }
+              title={status.permsReady && status.keyLoaded ? "Ready" : "Setup needed"}
             >
               {status.permsReady && status.keyLoaded ? "READY" : "SETUP"}
             </span>
-            <span
-              className={`hud-state ${status.estop ? "bad" : "ok"}`}
-              title={status.estop ? "Emergency stop active" : "Safety ready"}
-              aria-label={
-                status.estop ? "Emergency stop active" : "Safety ready"
-              }
+
+            <button
+              className="hud-btn hud-btn-icon"
+              onClick={(e) => { e.stopPropagation(); void toggleCollapse(); }}
+              title="Collapse HUD"
+              type="button"
             >
-              {status.estop ? "STOP" : "SAFE"}
-            </span>
+              <svg viewBox="0 0 24 24" className="hud-icon" aria-hidden="true">
+                <path d="M15 18l-6-6 6-6" />
+              </svg>
+            </button>
           </div>
         </div>
+
+        {hudPanel === "activity" && (
+          <div className="hud-dropdown">
+            {activityFeed.length === 0 ? (
+              <div className="hud-activity-item" style={{ opacity: 0.5 }}>No activity yet</div>
+            ) : (
+              activityFeed.map((a, i) => (
+                <div key={i} className="hud-activity-item">
+                  <span className={`phase-tag ${a.phase}`}>{a.phase}</span>
+                  <span>{a.step > 0 ? `[${a.step}/${a.max_steps}] ` : ""}{a.message}</span>
+                </div>
+              ))
+            )}
+            <div ref={activityEndRef} />
+          </div>
+        )}
+
+        {hudPanel === "command" && (
+          <div className="hud-input-panel">
+            <input
+              placeholder="Instruction (e.g. Open Chrome and go to google.com)"
+              value={hudInstruction}
+              onChange={(e) => setHudInstruction(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" && !e.shiftKey) {
+                  e.preventDefault();
+                  void runAgentLoopFromHudWithTracking();
+                }
+              }}
+            />
+            <textarea
+              placeholder="Task context (optional)"
+              rows={2}
+              value={hudContext}
+              onChange={(e) => setHudContext(e.target.value)}
+            />
+            <div className="hud-input-actions">
+              <button
+                className="hud-btn"
+                disabled={busy.run || !hudInstruction.trim()}
+                onClick={() => void runAgentLoopFromHudWithTracking()}
+              >
+                {looping ? "Running..." : "▶ Run Loop"}
+              </button>
+            </div>
+          </div>
+        )}
+        </>
+        )}
       </section>
     </main>
   );
@@ -711,7 +976,7 @@ function MainApp() {
   const [vision, setVision] = useState<VisionAction | null>(null);
   const [instruction, setInstruction] = useState("Click the Save button");
   const [taskContext, setTaskContext] = useState(
-    "Goal: click intended target only.\nConstraint: if uncertain or not visible, return action=none.",
+    "Goal: complete the task using clicks and keyboard shortcuts.\nUse Cmd+Tab to switch apps if the target app is not visible.\nReturn action=none only when the goal is fully achieved.",
   );
   const [model, setModel] = useState("mistralai/ministral-14b-2512");
 
@@ -728,6 +993,13 @@ function MainApp() {
     null,
   );
   const [log, setLog] = useState<string[]>([]);
+  const [modelActivity, setModelActivity] = useState<AgentStep[]>([]);
+  const modelActivityRef = useRef<HTMLDivElement>(null);
+
+  const pushModelActivity = (step: AgentStep) => {
+    setModelActivity((a) => [...a.slice(-40), step]);
+    setTimeout(() => modelActivityRef.current?.scrollTo({ top: modelActivityRef.current.scrollHeight, behavior: "smooth" }), 50);
+  };
 
   const [busy, setBusy] = useState({
     capture: false,
@@ -737,6 +1009,8 @@ function MainApp() {
     recordStop: false,
     replay: false,
   });
+  const loopStopRef = useRef(false);
+  const [looping, setLooping] = useState(false);
 
   const pushLog = (entry: string) => {
     const line = `${new Date().toLocaleTimeString()}  ${entry}`;
@@ -1116,25 +1390,38 @@ function MainApp() {
   };
 
   const executeClick = async () => {
-    if (!capture || !vision || vision.action !== "click") {
-      pushLog("click blocked: no click action ready");
+    if (!capture || !vision) {
+      pushLog("action blocked: no vision result ready");
       return;
     }
     setBusy((b) => ({ ...b, click: true }));
     try {
-      await invoke("execute_real_click_cmd", {
-        req: {
-          x_norm: vision.x_norm,
-          y_norm: vision.y_norm,
-          screenshot_w_px: capture.screenshot_w_px,
-          screenshot_h_px: capture.screenshot_h_px,
-          monitor_origin_x_pt: capture.monitor_origin_x_pt,
-          monitor_origin_y_pt: capture.monitor_origin_y_pt,
-          scale_factor: capture.scale_factor,
-          confidence: vision.confidence,
-        },
-      });
-      pushLog("real click executed");
+      if (vision.action === "click") {
+        await invoke("execute_real_click_cmd", {
+          req: {
+            x_norm: vision.x_norm,
+            y_norm: vision.y_norm,
+            screenshot_w_px: capture.screenshot_w_px,
+            screenshot_h_px: capture.screenshot_h_px,
+            monitor_origin_x_pt: capture.monitor_origin_x_pt,
+            monitor_origin_y_pt: capture.monitor_origin_y_pt,
+            scale_factor: capture.scale_factor,
+            confidence: vision.confidence,
+          },
+        });
+        pushLog("real click executed");
+      } else if (vision.action === "hotkey" && vision.keys?.length) {
+        await invoke("press_keys_cmd", {
+          req: { keys: vision.keys, delay_ms: 30 },
+        });
+        pushLog(`hotkey executed: ${vision.keys.map((k) => k.key).join("+")}`);
+      } else if (vision.action === "type" && vision.text) {
+        await invoke("type_text_cmd", { text: vision.text });
+        pushLog(`typed: "${vision.text}"`);
+      } else {
+        pushLog("action blocked: no actionable result");
+        return;
+      }
       await refreshRuntime(true);
     } catch (err) {
       pushLog(`click error: ${String(err)}`);
@@ -1164,29 +1451,139 @@ function MainApp() {
         `one-shot infer -> ${inferred.action} conf=${inferred.confidence.toFixed(2)}`,
       );
 
-      if (inferred.action !== "click") {
-        pushLog("one-shot stopped: model returned no click action");
+      if (inferred.action === "click") {
+        await invoke("execute_real_click_cmd", {
+          req: {
+            x_norm: inferred.x_norm,
+            y_norm: inferred.y_norm,
+            screenshot_w_px: captured.screenshot_w_px,
+            screenshot_h_px: captured.screenshot_h_px,
+            monitor_origin_x_pt: captured.monitor_origin_x_pt,
+            monitor_origin_y_pt: captured.monitor_origin_y_pt,
+            scale_factor: captured.scale_factor,
+            confidence: inferred.confidence,
+          },
+        });
+        pushLog("one-shot click executed");
+      } else if (inferred.action === "hotkey" && inferred.keys?.length) {
+        await invoke("press_keys_cmd", {
+          req: { keys: inferred.keys, delay_ms: 30 },
+        });
+        pushLog(`one-shot hotkey executed: ${inferred.keys.map((k) => k.key).join("+")}`);
+      } else {
+        pushLog("one-shot stopped: model returned no actionable result");
         return;
       }
-
-      await invoke("execute_real_click_cmd", {
-        req: {
-          x_norm: inferred.x_norm,
-          y_norm: inferred.y_norm,
-          screenshot_w_px: captured.screenshot_w_px,
-          screenshot_h_px: captured.screenshot_h_px,
-          monitor_origin_x_pt: captured.monitor_origin_x_pt,
-          monitor_origin_y_pt: captured.monitor_origin_y_pt,
-          scale_factor: captured.scale_factor,
-          confidence: inferred.confidence,
-        },
-      });
-      pushLog("one-shot click executed");
       await refreshRuntime(true);
     } catch (err) {
       pushLog(`one-shot error: ${String(err)}`);
       maybeLogRateLimitHint(err, "one-shot");
     } finally {
+      setBusy((b) => ({ ...b, capture: false, infer: false, click: false }));
+    }
+  };
+
+    const runAgentLoop = async () => {
+    loopStopRef.current = false;
+    setLooping(true);
+    setBusy((b) => ({ ...b, capture: true, infer: true, click: true }));
+    const MAX_STEPS = 30;
+    const stepHistory: string[] = [];
+    try {
+      for (let step = 1; step <= MAX_STEPS; step++) {
+        if (loopStopRef.current) {
+          pushLog(`agent loop stopped by user at step ${step}`);
+          break;
+        }
+
+        try {
+          const captureStep: AgentStep = { phase: "capture", step, max_steps: MAX_STEPS, message: "Capturing screen..." };
+          pushModelActivity(captureStep);
+          await emit("agent_step", captureStep).catch(() => undefined);
+
+          pushLog(`agent loop step ${step}/${MAX_STEPS}`);
+          const captured = await invoke<CaptureFrame>("capture_primary_cmd");
+          setCapture(captured);
+
+          const thinkStep: AgentStep = { phase: "thinking", step, max_steps: MAX_STEPS, message: "Model is thinking..." };
+          pushModelActivity(thinkStep);
+          await emit("agent_step", thinkStep).catch(() => undefined);
+
+          const inferred = await invoke<VisionAction>("infer_click_cmd", {
+            req: {
+              png_path: captured.png_path,
+              instruction: effectiveInstruction,
+              model,
+              step_context: stepHistory.length > 0 ? stepHistory.join("\n") : undefined,
+            },
+          });
+          setVision(inferred);
+          pushLog(
+            `  step ${step} infer -> ${inferred.action} conf=${inferred.confidence.toFixed(2)}`,
+          );
+
+          if (inferred.action === "none" || loopStopRef.current) {
+            pushLog(
+              inferred.action === "none"
+                ? `agent loop finished: model returned none ("${inferred.reason}")`
+                : `agent loop stopped by user at step ${step}`,
+            );
+            const doneStep: AgentStep = {
+              phase: "done", step, max_steps: MAX_STEPS,
+              message: inferred.action === "none" ? inferred.reason : "Stopped by user",
+            };
+            pushModelActivity(doneStep);
+            await emit("agent_step", doneStep).catch(() => undefined);
+            break;
+          }
+
+          if (inferred.action === "click") {
+            await invoke("execute_real_click_cmd", {
+              req: {
+                x_norm: inferred.x_norm, y_norm: inferred.y_norm,
+                screenshot_w_px: captured.screenshot_w_px, screenshot_h_px: captured.screenshot_h_px,
+                monitor_origin_x_pt: captured.monitor_origin_x_pt, monitor_origin_y_pt: captured.monitor_origin_y_pt,
+                scale_factor: captured.scale_factor, confidence: inferred.confidence,
+              },
+            });
+            stepHistory.push(`Step ${step}: clicked at (${inferred.x_norm}, ${inferred.y_norm}) — ${inferred.reason}`);
+            pushLog(`  step ${step} click executed`);
+            const s: AgentStep = { phase: "click", step, max_steps: MAX_STEPS, message: inferred.reason };
+            pushModelActivity(s); await emit("agent_step", s).catch(() => undefined);
+          } else if (inferred.action === "hotkey" && inferred.keys?.length) {
+            await invoke("press_keys_cmd", {
+              req: { keys: inferred.keys, delay_ms: 30 },
+            });
+            const keyDesc = inferred.keys.map((k) => k.key).join("+");
+            stepHistory.push(`Step ${step}: hotkey ${keyDesc} — ${inferred.reason}`);
+            pushLog(`  step ${step} hotkey: ${keyDesc}`);
+            const s: AgentStep = { phase: "hotkey", step, max_steps: MAX_STEPS, message: `${keyDesc} — ${inferred.reason}` };
+            pushModelActivity(s); await emit("agent_step", s).catch(() => undefined);
+          } else if (inferred.action === "type" && inferred.text) {
+            await invoke("type_text_cmd", { text: inferred.text });
+            stepHistory.push(`Step ${step}: typed "${inferred.text}" — ${inferred.reason}`);
+            pushLog(`  step ${step} typed: "${inferred.text}"`);
+            const s: AgentStep = { phase: "type", step, max_steps: MAX_STEPS, message: `"${inferred.text}" — ${inferred.reason}` };
+            pushModelActivity(s); await emit("agent_step", s).catch(() => undefined);
+          }
+
+          await refreshRuntime(true);
+        } catch (stepErr) {
+          pushLog(`  step ${step} error (continuing): ${String(stepErr)}`);
+          stepHistory.push(`Step ${step}: ERROR — ${String(stepErr)}`);
+          const errStep: AgentStep = { phase: "error", step, max_steps: MAX_STEPS, message: String(stepErr) };
+          pushModelActivity(errStep); await emit("agent_step", errStep).catch(() => undefined);
+          maybeLogRateLimitHint(stepErr, `agent-loop-step-${step}`);
+        }
+        // Brief pause to let the UI settle before next capture
+        await new Promise((r) => setTimeout(r, 800));
+      }
+      pushLog("agent loop complete");
+    } catch (err) {
+      pushLog(`agent loop error: ${String(err)}`);
+      maybeLogRateLimitHint(err, "agent-loop");
+    } finally {
+      setLooping(false);
       setBusy((b) => ({ ...b, capture: false, infer: false, click: false }));
     }
   };
@@ -1334,8 +1731,17 @@ function MainApp() {
           <p className="muted">OS-native vision automation with real clicks</p>
         </div>
         <div className="row">
-          <button onClick={() => void setHud(!hudEnabled)}>
+          <button onClick={() => {
+            const newVal = !hudEnabled;
+            void setHud(newVal);
+            if (!newVal) void emit("hud_hover_mode", true);
+          }}>
             {hudEnabled ? "Hide Top HUD" : "Show Top HUD"}
+          </button>
+          <button onClick={() => {
+            void emit("hud_hover_mode", !hudEnabled);
+          }}>
+            Hover Mode
           </button>
           <button onClick={() => setDarkMode((v) => !v)}>
             {darkMode ? "Light Mode" : "Dark Mode"}
@@ -1357,10 +1763,10 @@ function MainApp() {
           Sessions
         </button>
         <button
-          className={tab === "diagnostics" ? "tab active" : "tab"}
-          onClick={() => setTab("diagnostics")}
+          className={tab === "dev" ? "tab active" : "tab"}
+          onClick={() => setTab("dev")}
         >
-          Diagnostics
+          Dev Tools
         </button>
       </nav>
 
@@ -1372,18 +1778,10 @@ function MainApp() {
                 <div className="card-head">
                   <h2>Run</h2>
                   <div className="row">
-                    <button onClick={() => void refreshPermissions()}>
-                      Check Permissions
-                    </button>
-                    <button onClick={() => void requestPermissions()}>
-                      Request
-                    </button>
-                    <button onClick={() => void validateApiKey()}>
-                      Validate API Key
-                    </button>
-                    <button onClick={() => void refreshRuntime()}>
-                      Refresh Runtime
-                    </button>
+                    <button onClick={() => void refreshPermissions()}>Check Permissions</button>
+                    <button onClick={() => void requestPermissions()}>Request</button>
+                    <button onClick={() => void validateApiKey()}>Validate API Key</button>
+                    <button onClick={() => void refreshRuntime()}>Refresh Runtime</button>
                   </div>
                 </div>
                 <div className="health-grid">
@@ -1405,15 +1803,11 @@ function MainApp() {
                   </div>
                   <div className={`health ${hudEnabled ? "ok" : "bad"}`}>
                     <span>Top HUD</span>
-                    <strong>{hudEnabled ? "ON" : "OFF"}</strong>
+                    <strong>{hudEnabled ? "Visible" : "Hidden"}</strong>
                   </div>
                   <div className="health">
                     <span>Action Counter</span>
-                    <strong>
-                      {runtime
-                        ? `${runtime.actions}/${runtime.max_actions}`
-                        : "n/a"}
-                    </strong>
+                    <strong>{runtime ? `${runtime.actions}/${runtime.max_actions}` : "n/a"}</strong>
                   </div>
                 </div>
               </article>
@@ -1430,7 +1824,7 @@ function MainApp() {
                 <label>
                   Task Context (sent with instruction)
                   <textarea
-                    rows={4}
+                    rows={3}
                     value={taskContext}
                     onChange={(e) => setTaskContext(e.target.value)}
                   />
@@ -1444,73 +1838,30 @@ function MainApp() {
                 </label>
                 <div className="row">
                   <button
-                    onClick={() => void capturePrimary()}
-                    disabled={busy.capture}
-                  >
-                    {busy.capture ? "Capturing..." : "Capture"}
-                  </button>
-                  <button
-                    onClick={() => void inferClick()}
-                    disabled={busy.infer || !capture}
-                  >
-                    {busy.infer ? "Inferring..." : "Infer"}
-                  </button>
-                  <button
-                    className="primary"
-                    onClick={() => void executeClick()}
-                    disabled={busy.click}
-                  >
-                    {busy.click ? "Clicking..." : "Real Click"}
-                  </button>
-                  <button
                     className="primary"
                     onClick={() => void runLiveOnce()}
                     disabled={busy.capture || busy.infer || busy.click}
                   >
                     Run One-Shot
                   </button>
-                </div>
-              </article>
-
-              <article className="card">
-                <h3>Safety</h3>
-                <div className="row">
-                  <button onClick={() => void setEstop(false)}>
-                    Clear E-STOP
+                  <button
+                    className="primary"
+                    onClick={() => void runAgentLoop()}
+                    disabled={looping || busy.capture || busy.infer || busy.click}
+                  >
+                    {looping ? "Looping..." : "Run Agent Loop"}
                   </button>
-                  <button onClick={() => void setEstop(true)}>
-                    Force E-STOP
-                  </button>
+                  {looping && (
+                    <button onClick={() => { loopStopRef.current = true; }}>
+                      Stop Loop
+                    </button>
+                  )}
+                  <button onClick={() => void setEstop(false)}>Clear E-STOP</button>
+                  <button onClick={() => void setEstop(true)}>Force E-STOP</button>
                 </div>
                 <p className="muted">
                   Global kill switch: <code>Cmd+Shift+Esc</code>
                 </p>
-              </article>
-
-              <article className="card">
-                <h3>Runtime Data</h3>
-                <div className="json-grid">
-                  <div>
-                    <small>Capture</small>
-                    <pre>{JSON.stringify(capture, null, 2)}</pre>
-                  </div>
-                  <div>
-                    <small>Vision</small>
-                    <pre>{JSON.stringify(vision, null, 2)}</pre>
-                  </div>
-                  <div>
-                    <small>Permissions</small>
-                    <pre>{JSON.stringify(permissions, null, 2)}</pre>
-                  </div>
-                  <div>
-                    <small>Env</small>
-                    <pre>{JSON.stringify(envStatus, null, 2)}</pre>
-                  </div>
-                  <div>
-                    <small>Instruction Sent To Provider</small>
-                    <pre>{effectiveInstruction}</pre>
-                  </div>
-                </div>
               </article>
             </>
           ) : null}
@@ -1671,8 +2022,49 @@ function MainApp() {
             </>
           ) : null}
 
-          {tab === "diagnostics" ? (
+          {tab === "dev" ? (
             <>
+              <article className="card">
+                <h3>Step-by-Step Controls</h3>
+                <div className="row">
+                  <button onClick={() => void capturePrimary()} disabled={busy.capture}>
+                    {busy.capture ? "Capturing..." : "Capture"}
+                  </button>
+                  <button onClick={() => void inferClick()} disabled={busy.infer || !capture}>
+                    {busy.infer ? "Inferring..." : "Infer"}
+                  </button>
+                  <button className="primary" onClick={() => void executeClick()} disabled={busy.click}>
+                    {busy.click ? "Clicking..." : "Real Click"}
+                  </button>
+                </div>
+              </article>
+
+              <article className="card">
+                <h3>Runtime Data</h3>
+                <div className="json-grid">
+                  <div>
+                    <small>Capture</small>
+                    <pre>{JSON.stringify(capture, null, 2)}</pre>
+                  </div>
+                  <div>
+                    <small>Vision</small>
+                    <pre>{JSON.stringify(vision, null, 2)}</pre>
+                  </div>
+                  <div>
+                    <small>Permissions</small>
+                    <pre>{JSON.stringify(permissions, null, 2)}</pre>
+                  </div>
+                  <div>
+                    <small>Env</small>
+                    <pre>{JSON.stringify(envStatus, null, 2)}</pre>
+                  </div>
+                  <div>
+                    <small>Instruction Sent To Provider</small>
+                    <pre>{effectiveInstruction}</pre>
+                  </div>
+                </div>
+              </article>
+
               <article className="card">
                 <h2>How AI Knows What To Do</h2>
                 <ol className="plain-list">
@@ -1680,11 +2072,6 @@ function MainApp() {
                     <li key={line}>{line}</li>
                   ))}
                 </ol>
-              </article>
-
-              <article className="card">
-                <h3>Instruction Payload Preview</h3>
-                <pre>{effectiveInstruction}</pre>
               </article>
 
               <article className="card">
@@ -1700,6 +2087,27 @@ function MainApp() {
             </>
           ) : null}
         </section>
+
+        <aside className="card side">
+          <h3>Model Activity</h3>
+          <div className="model-activity" ref={modelActivityRef}>
+            {modelActivity.length === 0 ? (
+              <div className="model-activity-item" style={{ opacity: 0.5 }}>
+                <span className="activity-text">No model activity yet. Run the Agent Loop to see live updates.</span>
+              </div>
+            ) : (
+              modelActivity.map((a, i) => (
+                <div key={i} className="model-activity-item">
+                  <span className={`phase-badge ${a.phase}`}>{a.phase}</span>
+                  <span className="activity-text">
+                    {a.step > 0 && <strong>[{a.step}/{a.max_steps}] </strong>}
+                    {a.message}
+                  </span>
+                </div>
+              ))
+            )}
+          </div>
+        </aside>
 
         <aside className="card side">
           <h3>Activity Log</h3>

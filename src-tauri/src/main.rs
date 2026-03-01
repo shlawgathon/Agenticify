@@ -1,7 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 
-use enigo::{Button, Coordinate, Direction, Enigo, Mouse, Settings};
+use enigo::{Button, Coordinate, Direction, Enigo, Key, Keyboard, Mouse, Settings};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::{
@@ -75,6 +75,9 @@ struct InferClickRequest {
     png_path: String,
     instruction: String,
     model: Option<String>,
+    /// Prior action history for multi-step loops
+    #[serde(default)]
+    step_context: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -97,6 +100,17 @@ struct VisionAction {
     confidence: f64,
     reason: String,
     model_ms: u128,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    keys: Option<Vec<KeyAction>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    text: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct KeyAction {
+    key: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    direction: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -168,10 +182,28 @@ struct SessionReplayResult {
 #[derive(Debug, Deserialize)]
 struct VisionActionRaw {
     action: String,
+    #[serde(default)]
     x_norm: f64,
+    #[serde(default)]
     y_norm: f64,
     confidence: f64,
     reason: String,
+    #[serde(default)]
+    keys: Option<Vec<KeyAction>>,
+    #[serde(default)]
+    text: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct KeyCombo {
+    key: String,
+    direction: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct PressKeysRequest {
+    keys: Vec<KeyCombo>,
+    delay_ms: Option<u64>,
 }
 
 fn now_unix_ms() -> Result<u128, String> {
@@ -448,12 +480,32 @@ fn parse_vision_action(content: &str, model_ms: u128) -> Result<VisionAction, St
     let raw: VisionActionRaw = serde_json::from_str(&json_text).map_err(|e| e.to_string())?;
 
     let action = raw.action.to_lowercase();
-    if action != "click" && action != "none" {
-        return Err("action must be 'click' or 'none'".to_string());
+    if action != "click" && action != "none" && action != "hotkey" && action != "type" {
+        return Err("action must be 'click', 'hotkey', 'type', or 'none'".to_string());
     }
 
-    if !(0.0..=1000.0).contains(&raw.x_norm) || !(0.0..=1000.0).contains(&raw.y_norm) {
-        return Err("x_norm and y_norm must be in [0,1000]".to_string());
+    if action == "click" {
+        if !(0.0..=1000.0).contains(&raw.x_norm) || !(0.0..=1000.0).contains(&raw.y_norm) {
+            return Err("x_norm and y_norm must be in [0,1000]".to_string());
+        }
+    }
+
+    if action == "hotkey" {
+        match &raw.keys {
+            Some(keys) if !keys.is_empty() => {
+                for k in keys {
+                    parse_key_name(&k.key)?;
+                }
+            }
+            _ => return Err("hotkey action requires a non-empty 'keys' array".to_string()),
+        }
+    }
+
+    if action == "type" {
+        match &raw.text {
+            Some(t) if !t.is_empty() => {}
+            _ => return Err("type action requires a non-empty 'text' field".to_string()),
+        }
     }
 
     if !(0.0..=1.0).contains(&raw.confidence) {
@@ -467,6 +519,8 @@ fn parse_vision_action(content: &str, model_ms: u128) -> Result<VisionAction, St
         confidence: raw.confidence,
         reason: raw.reason,
         model_ms,
+        keys: raw.keys,
+        text: raw.text,
     })
 }
 
@@ -921,6 +975,7 @@ async fn replay_recording_session_cmd(
         png_path: frame_path.to_string_lossy().to_string(),
         instruction: req.instruction,
         model: req.model,
+        step_context: None,
     })
     .await?;
 
@@ -1049,12 +1104,42 @@ async fn infer_click_cmd(req: InferClickRequest) -> Result<VisionAction, String>
         );
     }
 
-    let system_prompt = "You are a desktop UI grounding model. Return only valid JSON matching this schema: {\"action\":\"click\"|\"none\", \"x_norm\":0-1000, \"y_norm\":0-1000, \"confidence\":0-1, \"reason\":\"...\"}. If the target is not visible, set action='none', confidence<=0.3, x_norm=0, y_norm=0.";
+    let system_prompt = "You are a desktop automation agent running in a loop. Each step you see a fresh screenshot and choose ONE action.\n\n\
+ACTIONS (return exactly one as JSON):\n\n\
+1. CLICK a UI element:\n\
+   {\"action\":\"click\", \"x_norm\":0-1000, \"y_norm\":0-1000, \"confidence\":0-1, \"reason\":\"...\"}\n\n\
+2. HOTKEY (keyboard shortcut):\n\
+   {\"action\":\"hotkey\", \"keys\":[{\"key\":\"Meta\",\"direction\":\"press\"},{\"key\":\"Space\",\"direction\":\"click\"},{\"key\":\"Meta\",\"direction\":\"release\"}], \"confidence\":0-1, \"reason\":\"...\"}\n\n\
+3. TYPE text into the currently focused field:\n\
+   {\"action\":\"type\", \"text\":\"Chrome\", \"confidence\":0-1, \"reason\":\"...\"}\n\n\
+4. DONE (goal achieved or truly impossible):\n\
+   {\"action\":\"none\", \"x_norm\":0, \"y_norm\":0, \"confidence\":0, \"reason\":\"...\"}\n\n\
+NAVIGATION STRATEGY - To open/switch to an app:\n\
+  Step 1: hotkey Cmd+Space (opens Spotlight)\n\
+  Step 2: type the app name (e.g. Chrome)\n\
+  Step 3: hotkey Return (launches it)\n\
+  This is MORE RELIABLE than Cmd+Tab.\n\n\
+GOAL RECOGNITION (CRITICAL - read carefully):\n\
+- After performing actions, LOOK at the ENTIRE screenshot to verify your progress\n\
+- DO NOT confuse random text fields, input boxes, or form fields that happen to contain a URL with the browser address bar\n\
+- The browser address bar is ONLY at the very top of a Chrome/Safari/Firefox window, next to navigation buttons (back/forward/reload)\n\
+- A text field inside a web page (e.g. a form input, search box, API key name field) is NOT the address bar even if it contains a URL\n\
+- Before declaring done, ask yourself: What app am I actually in? What page content is visible? Does it match the goal?\n\
+- If there are modals, dialogs, or overlays blocking the view, deal with those first (close them or interact with them)\n\
+- Only return action=none when the ENTIRE goal is VISUALLY CONFIRMED complete on screen\n\n\
+Available keys: Meta/Cmd, Tab, Space, Return/Enter, Escape, Shift, Control/Ctrl, Alt/Option, Up, Down, Left, Right, Backspace, Delete, Home, End, PageUp, PageDown, F1-F12, or any single character.\n\
+Directions: press (hold), release (let go), click (tap, default).\n\
+Common shortcuts: Cmd+T (new tab), Cmd+W (close tab), Cmd+L (address bar), Cmd+N (new window).\n\
+Return ONLY valid JSON.";
 
-    let user_prompt = format!(
-        "Task: {}\nCoordinate space: normalized [0,1000] over the provided screenshot.\nThe image may be resized for transport but keeps the same full scene and aspect ratio (no crop).\nCoordinates must be resolution-independent normalized values.\nReturn the best click target.",
+    let mut user_prompt = format!(
+        "Task: {}\nCoordinate space: normalized [0,1000] over the provided screenshot.\nLook at the screenshot carefully. What is the NEXT single action to make progress toward the goal?",
         req.instruction
     );
+
+    if let Some(ctx) = &req.step_context {
+        user_prompt.push_str(&format!("\n\nPrevious actions taken:\n{}", ctx));
+    }
 
     let api_key = resolve_primary_api_key();
     if api_key.trim().is_empty() {
@@ -1121,6 +1206,98 @@ fn execute_real_click_cmd(
     req: ClickRequest,
 ) -> Result<(), String> {
     perform_real_click(Some(&app), &guards, &req)
+}
+
+fn parse_key_name(name: &str) -> Result<Key, String> {
+    match name {
+        "Meta" | "Command" | "Cmd" => Ok(Key::Meta),
+        "Tab" => Ok(Key::Tab),
+        "Space" => Ok(Key::Space),
+        "Return" | "Enter" => Ok(Key::Return),
+        "Escape" | "Esc" => Ok(Key::Escape),
+        "Shift" => Ok(Key::Shift),
+        "Control" | "Ctrl" => Ok(Key::Control),
+        "Alt" | "Option" => Ok(Key::Alt),
+        "UpArrow" | "Up" => Ok(Key::UpArrow),
+        "DownArrow" | "Down" => Ok(Key::DownArrow),
+        "LeftArrow" | "Left" => Ok(Key::LeftArrow),
+        "RightArrow" | "Right" => Ok(Key::RightArrow),
+        "Backspace" => Ok(Key::Backspace),
+        "Delete" => Ok(Key::Delete),
+        "Home" => Ok(Key::Home),
+        "End" => Ok(Key::End),
+        "PageUp" => Ok(Key::PageUp),
+        "PageDown" => Ok(Key::PageDown),
+        "CapsLock" => Ok(Key::CapsLock),
+        "F1" => Ok(Key::F1),
+        "F2" => Ok(Key::F2),
+        "F3" => Ok(Key::F3),
+        "F4" => Ok(Key::F4),
+        "F5" => Ok(Key::F5),
+        "F6" => Ok(Key::F6),
+        "F7" => Ok(Key::F7),
+        "F8" => Ok(Key::F8),
+        "F9" => Ok(Key::F9),
+        "F10" => Ok(Key::F10),
+        "F11" => Ok(Key::F11),
+        "F12" => Ok(Key::F12),
+        s if s.chars().count() == 1 => Ok(Key::Unicode(s.chars().next().unwrap())),
+        other => Err(format!("Unknown key name: '{}'", other)),
+    }
+}
+
+fn parse_direction(dir: Option<&str>) -> Result<Direction, String> {
+    match dir {
+        None | Some("click") | Some("Click") => Ok(Direction::Click),
+        Some("press") | Some("Press") => Ok(Direction::Press),
+        Some("release") | Some("Release") => Ok(Direction::Release),
+        Some(other) => Err(format!(
+            "Unknown direction '{}'. Use 'press', 'release', or 'click'.",
+            other
+        )),
+    }
+}
+
+#[tauri::command]
+fn press_keys_cmd(guards: State<RuntimeGuards>, req: PressKeysRequest) -> Result<(), String> {
+    if guards.estop.load(Ordering::SeqCst) {
+        return Err("Emergency stop active".to_string());
+    }
+
+    let delay = Duration::from_millis(req.delay_ms.unwrap_or(30));
+    let mut enigo = Enigo::new(&Settings::default()).map_err(|e| e.to_string())?;
+
+    for (i, combo) in req.keys.iter().enumerate() {
+        let key = parse_key_name(&combo.key)?;
+        let direction = parse_direction(combo.direction.as_deref())?;
+
+        enigo
+            .key(key, direction)
+            .map_err(|e| format!("key '{}' failed: {}", combo.key, e))?;
+
+        if i + 1 < req.keys.len() {
+            thread::sleep(delay);
+        }
+    }
+
+    println!(
+        "[keyboard] executed {} key action(s)",
+        req.keys.len()
+    );
+    Ok(())
+}
+
+#[tauri::command]
+fn type_text_cmd(guards: State<RuntimeGuards>, text: String) -> Result<(), String> {
+    if guards.estop.load(Ordering::SeqCst) {
+        return Err("Emergency stop active".to_string());
+    }
+
+    let mut enigo = Enigo::new(&Settings::default()).map_err(|e| e.to_string())?;
+    enigo.text(&text).map_err(|e| e.to_string())?;
+
+    println!("[keyboard] typed {} char(s)", text.len());
+    Ok(())
 }
 
 fn init_display_scale(display_state: &DisplayState) {
@@ -1223,6 +1400,8 @@ fn main() {
             capture_primary_cmd,
             infer_click_cmd,
             execute_real_click_cmd,
+            press_keys_cmd,
+            type_text_cmd,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri app");

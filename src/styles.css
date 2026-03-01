@@ -1,5 +1,6 @@
 :root {
-  --font-ui: "Fira Code", "Fira Mono", Menlo, Consolas, "DejaVu Sans Mono", monospace;
+  --font-ui:
+    "Fira Code", "Fira Mono", Menlo, Consolas, "DejaVu Sans Mono", monospace;
   --bg: #e8eef8;
   --bg-2: #dce7f5;
   --text: #0f172a;
@@ -15,7 +16,7 @@
   --pre: rgba(248, 250, 252, 0.6);
 }
 
-:root[data-theme='dark'] {
+:root[data-theme="dark"] {
   --bg: #060d18;
   --bg-2: #0d1728;
   --text: #e2e8f0;
@@ -377,9 +378,12 @@ pre {
 
 .plain-list {
   margin: 0;
-  padding-left: 18px;
+  padding-left: 24px;
   display: grid;
   gap: 8px;
+  font-family: var(--font-ui);
+  font-size: 0.88rem;
+  line-height: 1.55;
 }
 
 code {
@@ -409,22 +413,51 @@ code {
 .hud-pill {
   width: 100%;
   height: 100%;
-  border-radius: 999px;
+  border-radius: 18px;
   border: 1px solid rgba(170, 214, 255, 0.26);
-  background: linear-gradient(180deg, rgba(6, 16, 30, 0.68), rgba(6, 16, 30, 0.6));
+  background: linear-gradient(
+    180deg,
+    rgba(6, 16, 30, 0.98),
+    rgba(6, 16, 30, 0.90)
+  );
   color: #ecf7ff;
-  box-shadow: 0 10px 22px rgba(2, 6, 23, 0.34), inset 0 1px 0 rgba(255, 255, 255, 0.09);
+  box-shadow:
+    0 10px 22px rgba(2, 6, 23, 0.34),
+    inset 0 1px 0 rgba(255, 255, 255, 0.09);
   pointer-events: auto;
   display: flex;
+  flex-direction: column;
+  justify-content: center;
+  padding: 6px 10px;
+  gap: 6px;
+}
+
+.hud-pill.expanded {
+  height: auto;
+  justify-content: flex-start;
+  overflow: hidden;
+}
+
+.hud-pill.collapsed {
+  width: 36px;
+  height: 36px;
+  border-radius: 50%;
+  padding: 0;
   align-items: center;
   justify-content: center;
-  padding: 0 2px;
+}
+
+.hud-root.hud-collapsed {
+  justify-content: center;
+  align-items: flex-start;
+  padding-top: 6px;
 }
 
 .hud-main {
   display: flex;
   align-items: center;
-  justify-content: center;
+  justify-content: space-between;
+  width: 100%;
   gap: 5px;
 }
 
@@ -494,7 +527,10 @@ code {
   font-weight: 600;
   padding: 2px 7px;
   cursor: pointer;
-  transition: border-color 120ms ease, background-color 120ms ease, transform 120ms ease;
+  transition:
+    border-color 120ms ease,
+    background-color 120ms ease,
+    transform 120ms ease;
 }
 
 .hud-btn:hover {
@@ -511,6 +547,12 @@ code {
 .hud-btn.active {
   border-color: rgba(61, 207, 145, 0.72);
   background: rgba(19, 127, 74, 0.28);
+}
+
+.hud-btn.overlay-off {
+  border-color: rgba(255, 122, 122, 0.72);
+  background: rgba(255, 122, 122, 0.14);
+  color: #ffc0c0;
 }
 
 .hud-btn-icon {
@@ -550,7 +592,9 @@ code {
   border-radius: 50%;
   transform: translate(-50%, -50%);
   background: #00e1ff;
-  box-shadow: 0 0 0 2px rgba(255, 255, 255, 0.85), 0 0 20px rgba(0, 225, 255, 0.9);
+  box-shadow:
+    0 0 0 2px rgba(255, 255, 255, 0.85),
+    0 0 20px rgba(0, 225, 255, 0.9);
 }
 
 .agent-cursor-ring {
@@ -622,4 +666,211 @@ code {
   .flow-grid {
     grid-template-columns: 1fr;
   }
+}
+
+/* ── HUD Expanded States ───────────────────── */
+
+.hud-root.hud-expanded {
+  align-items: flex-start;
+  padding-top: 4px;
+}
+
+.hud-root.hud-hover-only .hud-pill {
+  opacity: 0.06;
+  transition: opacity 250ms ease;
+}
+
+.hud-root.hud-hover-only .hud-pill:hover,
+.hud-root.hud-hover-only .hud-pill.expanded {
+  opacity: 1;
+}
+
+
+
+.hud-dropdown {
+  width: 100%;
+  max-height: 110px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: 4px 0;
+  border-top: 1px solid rgba(170, 214, 255, 0.12);
+}
+
+.hud-activity-item {
+  font-size: 0.56rem;
+  line-height: 1.3;
+  color: rgba(226, 232, 240, 0.8);
+  display: flex;
+  align-items: flex-start;
+  gap: 5px;
+  padding: 2px 4px;
+}
+
+.hud-activity-item .phase-tag {
+  flex-shrink: 0;
+  font-weight: 700;
+  font-size: 0.52rem;
+  border-radius: 4px;
+  padding: 1px 4px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.phase-tag.capture {
+  background: rgba(90, 176, 255, 0.22);
+  color: #8ed6ff;
+}
+.phase-tag.thinking {
+  background: rgba(255, 190, 60, 0.22);
+  color: #ffd080;
+}
+.phase-tag.done {
+  background: rgba(61, 207, 145, 0.22);
+  color: #8ef5c8;
+}
+.phase-tag.error {
+  background: rgba(255, 122, 122, 0.22);
+  color: #ffc0c0;
+}
+.phase-tag.type {
+  background: rgba(190, 130, 255, 0.22);
+  color: #d8b4fe;
+}
+.phase-tag.hotkey {
+  background: rgba(0, 200, 200, 0.22);
+  color: #80f0f0;
+}
+.phase-tag.click {
+  background: rgba(90, 176, 255, 0.22);
+  color: #8ed6ff;
+}
+
+/* ── HUD Command Input ───────────────────── */
+
+.hud-input-panel {
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  padding: 4px 0;
+  border-top: 1px solid rgba(170, 214, 255, 0.12);
+}
+
+.hud-input-panel input,
+.hud-input-panel textarea {
+  width: 100%;
+  min-height: 0;
+  border-radius: 8px;
+  border: 1px solid rgba(170, 214, 255, 0.18);
+  background: rgba(7, 18, 35, 0.5);
+  color: #ecf7ff;
+  font-family: var(--font-ui);
+  font-size: 0.6rem;
+  padding: 5px 7px;
+  resize: none;
+}
+
+.hud-input-panel input::placeholder,
+.hud-input-panel textarea::placeholder {
+  color: rgba(148, 163, 184, 0.6);
+}
+
+.hud-input-panel .hud-input-actions {
+  display: flex;
+  gap: 4px;
+  justify-content: flex-end;
+}
+
+.hud-input-panel .hud-input-actions button {
+  font-size: 0.55rem;
+  padding: 3px 10px;
+  border-radius: 6px;
+}
+
+/* ── Dashboard Model Activity ───────────────────── */
+
+.model-activity {
+  max-height: 220px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.model-activity-item {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 6px 8px;
+  border-radius: 8px;
+  border: 1px solid var(--card-border);
+  background: var(--chip);
+  font-size: 0.78rem;
+}
+
+.model-activity-item .phase-badge {
+  flex-shrink: 0;
+  font-weight: 700;
+  font-size: 0.68rem;
+  border-radius: 6px;
+  padding: 2px 6px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+:root .phase-badge.capture {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+:root .phase-badge.thinking {
+  background: rgba(255, 190, 60, 0.15);
+  color: #c78a1a;
+}
+:root .phase-badge.done {
+  background: rgba(19, 127, 74, 0.12);
+  color: var(--ok);
+}
+:root .phase-badge.error {
+  background: rgba(180, 35, 24, 0.12);
+  color: var(--bad);
+}
+:root .phase-badge.type {
+  background: rgba(160, 80, 255, 0.12);
+  color: #8b5cf6;
+}
+:root .phase-badge.hotkey {
+  background: rgba(0, 168, 176, 0.12);
+  color: #0891b2;
+}
+:root .phase-badge.click {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+:root[data-theme="dark"] .phase-badge.capture {
+  background: rgba(90, 176, 255, 0.18);
+  color: #5ab0ff;
+}
+:root[data-theme="dark"] .phase-badge.thinking {
+  background: rgba(255, 190, 60, 0.18);
+  color: #ffd080;
+}
+:root[data-theme="dark"] .phase-badge.done {
+  background: rgba(61, 207, 145, 0.18);
+  color: #3dcf91;
+}
+:root[data-theme="dark"] .phase-badge.error {
+  background: rgba(255, 122, 122, 0.18);
+  color: #ff7a7a;
+}
+
+.model-activity-item .activity-text {
+  color: var(--muted);
+  line-height: 1.35;
+}
+
+.model-activity-item .activity-text strong {
+  color: var(--text);
 }
