@@ -156,24 +156,35 @@ pub fn start_session_cmd(
             let tick_start = Instant::now();
             let tick = frame_counter.fetch_add(1, Ordering::SeqCst) + 1;
 
-            if let Ok(monitors) = Monitor::all() {
-                for monitor in monitors {
-                    let monitor_id = match monitor.id() {
-                        Ok(id) => id,
-                        Err(_) => continue,
-                    };
-
-                    let image = match monitor.capture_image() {
-                        Ok(img) => img,
-                        Err(_) => continue,
-                    };
-
-                    let mon_dir = frame_dir.join(format!("monitor-{}", monitor_id));
-                    let _ = fs::create_dir_all(&mon_dir);
-
-                    let frame_file = mon_dir.join(format!("frame-{:06}.png", tick));
-                    let _ = image.save(&frame_file);
+            // Acquire the global capture mutex so we don't race with
+            // capture_primary_cmd (agent loop). If the lock is held,
+            // try_lock returns Err and we skip this frame gracefully.
+            // IMPORTANT: only hold the lock during capture, NOT during save.
+            let captured: Vec<(u32, image::DynamicImage)> = if let Ok(_guard) = crate::capture_mutex().try_lock() {
+                let mut frames = Vec::new();
+                if let Ok(monitors) = Monitor::all() {
+                    for monitor in monitors {
+                        let monitor_id = match monitor.id() {
+                            Ok(id) => id,
+                            Err(_) => continue,
+                        };
+                        if let Ok(image) = monitor.capture_image() {
+                            frames.push((monitor_id, image::DynamicImage::from(image)));
+                        }
+                    }
                 }
+                frames
+                // _guard dropped here — lock released before disk I/O
+            } else {
+                Vec::new() // agent is capturing — skip this recording frame
+            };
+
+            // Save frames to disk OUTSIDE the lock
+            for (monitor_id, image) in captured {
+                let mon_dir = frame_dir.join(format!("monitor-{}", monitor_id));
+                let _ = fs::create_dir_all(&mon_dir);
+                let frame_file = mon_dir.join(format!("frame-{:06}.png", tick));
+                let _ = image.save(&frame_file);
             }
 
             let elapsed = tick_start.elapsed();

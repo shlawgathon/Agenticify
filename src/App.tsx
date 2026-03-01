@@ -549,6 +549,23 @@ function HudWindow() {
       unlistenStatus = await listen<HudUpdate>("hud_update", ({ payload }) => {
         setStatus(payload);
       });
+
+      // Self-bootstrap: query permissions and env status directly so the HUD
+      // doesn't start with red "SETUP" while waiting for the main window.
+      try {
+        const [perms, env] = await Promise.all([
+          invoke<PermissionState>("check_permissions_cmd"),
+          invoke<EnvStatus>("env_status_cmd"),
+        ]);
+        setStatus((prev) => ({
+          ...prev,
+          permsReady: Boolean(perms.screen_recording && perms.accessibility),
+          keyLoaded: Boolean(env.mistral_api_key_loaded),
+        }));
+      } catch {
+        // best-effort — main window's hud_update will correct this later
+      }
+
       await refreshRecordingState();
     })();
 
@@ -1020,6 +1037,8 @@ function HudWindow() {
       } catch { /* best-effort */ }
     }
 
+    let loopSuccess = false;
+
     try {
       for (let step = 1; step <= MAX_STEPS; step++) {
         if (loopStopRef.current) break;
@@ -1043,12 +1062,14 @@ function HudWindow() {
           },
         });
 
-        if (inferred.action === "none" || loopStopRef.current) {
+        if (inferred.action === "none") {
+          loopSuccess = true;
           const doneStep: AgentStep = { phase: "done", step, max_steps: MAX_STEPS, message: inferred.reason };
           collectedSteps.push(doneStep);
           await emit("agent_step", doneStep).catch(() => undefined);
           break;
         }
+        if (loopStopRef.current) break;
 
         if (inferred.action === "click") {
           await invoke("execute_real_click_cmd", {
@@ -1096,12 +1117,17 @@ function HudWindow() {
         try {
           const manifest = await invoke<SessionManifest>("stop_session_cmd");
           setRecActive(false);
-          // Save the activity log to the newly created session
-          await invoke("save_activity_log_cmd", {
-            sessionId: manifest.session_id,
-            activityLog: collectedSteps,
-          }).catch(() => { /* best-effort */ });
-          void refreshSessions();
+          if (loopSuccess) {
+            // Save the activity log only on successful completion
+            await invoke("save_activity_log_cmd", {
+              sessionId: manifest.session_id,
+              activityLog: collectedSteps,
+            }).catch(() => { /* best-effort */ });
+            void refreshSessions();
+          } else {
+            // Delete the session recording on failure/manual stop
+            await invoke("delete_session_cmd", { sessionId: manifest.session_id }).catch(() => {});
+          }
         } catch { /* best-effort */ }
       }
       setLooping(false);
@@ -2726,17 +2752,19 @@ function MainApp() {
               <button
                 className="btn"
                 style={{ fontSize: "0.7rem", padding: "3px 8px" }}
-                onClick={() => {
+                onClick={async () => {
                   const md = modelActivity
                     .map((a) => `- **[${a.phase.toUpperCase()}]** ${a.step > 0 ? `[${a.step}/${a.max_steps}] ` : ""}${a.message}`)
                     .join("\n");
-                  const blob = new Blob([`# Model Activity\n\n${md}\n`], { type: "text/markdown" });
-                  const url = URL.createObjectURL(blob);
-                  const a = document.createElement("a");
-                  a.href = url;
-                  a.download = "model-activity.md";
-                  a.click();
-                  URL.revokeObjectURL(url);
+                  try {
+                    const path = await invoke<string>("export_markdown_cmd", {
+                      filename: "model-activity.md",
+                      content: `# Model Activity\n\n${md}\n`,
+                    });
+                    addLog(`Exported activity to ${path}`);
+                  } catch (err) {
+                    addLog(`Export failed: ${err}`);
+                  }
                 }}
               >
                 Export .md

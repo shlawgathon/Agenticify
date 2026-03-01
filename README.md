@@ -15,7 +15,7 @@ Built with **Tauri 2** (Rust backend) + **React** (frontend). Runs natively on m
 - Step history is passed between iterations so the agent remembers what it already did.
 - Configurable confidence threshold — low-confidence actions are rejected automatically.
 - **Window context awareness** — detects the currently active application and window title, feeding it to the model so it understands the current context.
-- **App state awareness** — queries scriptable macOS apps (Spotify, Chrome, Safari, Finder, etc.) via AppleScript for their internal state (player state, current track, active URL, folder path, etc.). Unknown apps get a generic focused-element probe. This means the agent knows if Spotify is paused or playing without relying on tiny UI icons.
+- **App state awareness** — queries scriptable macOS apps (Spotify, Chrome, Safari, Finder, etc.) via AppleScript for their internal state (player state, current track, active URL, folder path, etc.). Unknown apps get a generic focused-element probe. All queries have a **2-second kill timeout** to prevent hangs.
 
 ### Virtual Cursor (CGEvent)
 
@@ -42,6 +42,22 @@ Every click goes through a multi-stage precision pipeline:
 6. **Visual verification** — the transparent overlay shows a pulsing cursor at the exact click target, so you can visually confirm accuracy.
 7. **Full telemetry** — every click logs: pixel coords, screenshot dims, scale factor, monitor origin, and final point in logical coordinates.
 
+### Context Injection Pipeline
+
+Every inference call assembles a rich prompt from **7 distinct sources** — this is what the model "sees" and "knows" on each step:
+
+| Layer                         | Source                                                       | Injected Into               | Description                                                                                                                                                                                                                                                       |
+| ----------------------------- | ------------------------------------------------------------ | --------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **1. System Prompt**          | `main.rs` (hardcoded)                                        | `system` message            | Full action schema (click, hotkey, type, shell, none), Spotlight navigation rules, stopping criteria, text editing patterns, click accuracy heuristics, hotkey reference                                                                                          |
+| **2. Screenshot**             | `xcap` screen capture                                        | `user` message (image part) | PNG of the primary monitor, adaptively downscaled to `AGENT_INFER_MAX_DIM` (default 2048px). Encoded as base64 data URI                                                                                                                                           |
+| **3. Task Instruction**       | User input (HUD / dashboard)                                 | `user` message (text)       | The natural-language goal, e.g. "Open Chrome and go to github.com"                                                                                                                                                                                                |
+| **4. Coordinate System**      | Computed from screenshot dims                                | `user` message (text)       | Pixel coordinate bounds: `"The screenshot image is {W}x{H} pixels… (0,0) is top-left…"`                                                                                                                                                                           |
+| **5. OS Context**             | `gather_os_context()` via AppleScript                        | `user` message (text)       | **Frontmost app** name + **window title**, **running GUI apps** list, **open window names** in frontmost app, **app-specific state** (e.g. Spotify track, Chrome URL, Finder path — queried via per-app AppleScript with 2s kill timeout), **system time** (unix) |
+| **6. App-Specific Shortcuts** | `shortcuts::get_or_fetch_global()` via LLM                   | `user` message (text)       | Top 20 macOS keyboard shortcuts for the frontmost app, dynamically fetched on first encounter and session-cached                                                                                                                                                  |
+| **7. Step History**           | `stepHistory[]` (in-memory, frontend) + `getWindowContext()` | `user` message (text)       | Accumulated action log from prior steps in the current run: `"Step 1: click (x,y) — reason"`, `"Step 2: hotkey Cmd+T — reason"`, etc. Includes the currently active window context at the top                                                                     |
+
+**What is NOT persisted**: The full model prompt, raw model response, and thinking/reasoning traces are **not saved** to disk. Only the extracted `VisionAction` (action, coordinates, confidence, reason) survives — optionally written to `activity_log.json` per session. Step history lives in-memory for the duration of one agent run only.
+
 ### Model
 
 Uses **Mistral Large 3** (`mistralai/mistral-large-2512`) via OpenRouter for all vision inference.
@@ -58,6 +74,7 @@ The agent **always prefers keyboard shortcuts over clicking** — clicking is th
 - **System apps skipped** — loginwindow, Dock, SystemUIServer, and other system processes are automatically excluded.
 - **Static fallback** — the system prompt also includes a built-in reference for browser, macOS, Finder, and Terminal shortcuts.
 - **Priority order** — app-specific shortcuts → generic hotkeys → clicking (last resort).
+- **Wrong-app safety** — if the frontmost app is not the target app, the agent will **never click** (guaranteed wrong target). Instead it uses Cmd+Space Spotlight to switch to the correct app first.
 
 ### Floating HUD (Always-On-Top)
 

@@ -30,6 +30,15 @@ const DEFAULT_MISTRAL_BASE: &str = "https://openrouter.ai/api/v1";
 const DEFAULT_CONFIDENCE_THRESHOLD: f64 = 0.60;
 const DEFAULT_INFER_MAX_DIM: u32 = 2048;
 
+/// Global mutex to serialize all xcap screen captures.
+/// macOS's CGWindowListCreateImage is NOT safe to call concurrently
+/// from multiple threads — doing so crashes the process.
+pub(crate) fn capture_mutex() -> &'static Mutex<()> {
+    use std::sync::OnceLock;
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
 #[derive(Default)]
 struct RuntimeGuards {
     estop: AtomicBool,
@@ -820,6 +829,36 @@ fn open_path_cmd(path: String) -> Result<(), String> {
 }
 
 #[tauri::command]
+fn export_markdown_cmd(filename: String, content: String) -> Result<String, String> {
+    let home = std::env::var("HOME").map_err(|_| "Cannot determine HOME directory".to_string())?;
+    let desktop = PathBuf::from(&home).join("Desktop");
+    if !desktop.exists() {
+        fs::create_dir_all(&desktop).map_err(|e| e.to_string())?;
+    }
+
+    // Avoid overwriting: if file exists, append a counter
+    let base = filename.trim_end_matches(".md");
+    let mut target = desktop.join(&filename);
+    let mut counter = 1u32;
+    while target.exists() {
+        target = desktop.join(format!("{}-{}.md", base, counter));
+        counter += 1;
+    }
+
+    fs::write(&target, &content).map_err(|e| e.to_string())?;
+
+    // Reveal in Finder
+    #[cfg(target_os = "macos")]
+    {
+        let _ = Command::new("open").arg("-R").arg(&target).status();
+    }
+
+    let path_str = target.to_string_lossy().to_string();
+    println!("[export] wrote {} ({} bytes)", path_str, content.len());
+    Ok(path_str)
+}
+
+#[tauri::command]
 fn recording_status_cmd(recording: State<RecordingState>) -> RecordingStatus {
     match recording.active.lock() {
         Ok(guard) => {
@@ -1076,6 +1115,21 @@ fn set_estop_cmd(guards: State<RuntimeGuards>, enabled: bool) -> RuntimeState {
 
 #[tauri::command]
 fn capture_primary_cmd(display_state: State<DisplayState>) -> Result<CaptureFrame, String> {
+    // Acquire capture mutex with retry (sync commands run on main thread —
+    // blocking .lock() would hang the entire UI).
+    let mut guard = None;
+    for _ in 0..40 {
+        match capture_mutex().try_lock() {
+            Ok(g) => { guard = Some(g); break; }
+            Err(std::sync::TryLockError::WouldBlock) => {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err("Capture mutex poisoned".to_string());
+            }
+        }
+    }
+    let _capture_lock = guard.ok_or("Capture lock busy (recording in progress), try again")?;
     let started = Instant::now();
     let monitor = primary_monitor()?;
 
@@ -1131,6 +1185,44 @@ fn capture_primary_cmd(display_state: State<DisplayState>) -> Result<CaptureFram
 struct FrontmostApp {
     app_name: String,
     window_title: String,
+}
+/// Run an osascript with a timeout. Returns stdout trimmed, or empty on failure/timeout.
+fn run_osascript_timeout(script: &str, timeout: Duration) -> String {
+    let mut child = match Command::new("osascript")
+        .arg("-e")
+        .arg(script)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(_) => return String::new(),
+    };
+
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_status)) => {
+                return child.stdout.take()
+                    .and_then(|mut out| {
+                        use std::io::Read;
+                        let mut buf = String::new();
+                        out.read_to_string(&mut buf).ok()?;
+                        Some(buf.trim().to_string())
+                    })
+                    .unwrap_or_default();
+            }
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return String::new();
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
+            Err(_) => return String::new(),
+        }
+    }
 }
 
 /// Query app-specific state via AppleScript for scriptable macOS apps.
@@ -1327,27 +1419,14 @@ fn query_app_state(app_name: &str) -> String {
                 end tell"#,
                 app_name
             );
-            let output = Command::new("osascript")
-                .arg("-e")
-                .arg(&generic_script)
-                .output();
-            return output
-                .ok()
-                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-                .unwrap_or_default();
+            return run_osascript_timeout(&generic_script, Duration::from_secs(2));
         }
     };
 
     // For Slack/Discord, substitute {APP} placeholder
     let final_script = script.replace("{APP}", app_name);
 
-    Command::new("osascript")
-        .arg("-e")
-        .arg(&final_script)
-        .output()
-        .ok()
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .unwrap_or_default()
+    run_osascript_timeout(&final_script, Duration::from_secs(2))
 }
 
 /// Gather rich OS context to inject into the agent's prompt.
@@ -1545,61 +1624,88 @@ async fn infer_click_cmd(req: InferClickRequest) -> Result<VisionAction, String>
         );
     }
 
-    let system_prompt = "You are a desktop automation agent running in a persistent loop. Each step you receive a fresh screenshot and choose ONE action. You have up to 30 steps — USE THEM ALL if needed. Do NOT stop early.\n\n\
-ACTIONS (return exactly one as JSON):\n\n\
-1. CLICK: {\"action\":\"click\", \"x_norm\":<px_x>, \"y_norm\":<px_y>, \"confidence\":0-1, \"reason\":\"...\"}\n\
-   Pixel coords in the screenshot. (0,0) = top-left.\n\n\
-2. HOTKEY: {\"action\":\"hotkey\", \"keys\":[{\"key\":\"Meta\",\"direction\":\"press\"},{\"key\":\"Space\",\"direction\":\"click\"},{\"key\":\"Meta\",\"direction\":\"release\"}], \"confidence\":0-1, \"reason\":\"...\"}\n\n\
-3. TYPE: {\"action\":\"type\", \"text\":\"Chrome\", \"confidence\":0-1, \"reason\":\"...\"}\n\
-   Types into whatever field currently has focus. Do NOT click before typing if a field is already focused (e.g. Spotlight).\n\n\
-4. SHELL: {\"action\":\"shell\", \"command\":\"ls -la ~/Desktop\", \"confidence\":0-1, \"reason\":\"...\"}\n\
-   Use for files, git, installs, scripts, system info. Output appears in next step's context.\n\n\
-5. DONE: {\"action\":\"none\", \"x_norm\":0, \"y_norm\":0, \"confidence\":0, \"reason\":\"...\"}\n\n\
-═══ SPOTLIGHT / APP SWITCHING (CRITICAL) ═══\n\
-To open ANY app, follow this EXACT sequence across steps:\n\
-  Step A: hotkey Cmd+Space → opens Spotlight. It auto-focuses the search field.\n\
-  Step B: type \"AppName\" → Spotlight is ALREADY focused, just type immediately.\n\
-  Step C: hotkey Return → launches the top result.\n\
-⚠ AFTER Cmd+Space, your VERY NEXT action MUST be \"type\". Do NOT click ANYTHING.\n\
-  Clicking anywhere (buttons, screen, dock) DISMISSES Spotlight and you lose it.\n\
-  Do NOT click on Spotlight results either — just press Return.\n\
-  Do NOT click Dock icons — coordinate accuracy is too unreliable.\n\
-  Do NOT use Cmd+Tab — you cannot see which app is highlighted.\n\n\
-═══ WHEN TO STOP (READ CAREFULLY) ═══\n\
-Return action=none ONLY when the goal is 100% VISUALLY CONFIRMED on screen.\n\
+    let system_prompt = "You are a desktop automation agent running on macOS. Each step you receive a fresh screenshot of the entire screen and choose ONE action. You have up to 30 steps — USE THEM ALL if needed. Do NOT stop early.\n\n\
+═══ AGENTICIFY HUD OVERLAY (CRITICAL — READ FIRST) ═══\n\
+There is a small transparent overlay bar at the TOP CENTER of the screen. It belongs to Agenticify (YOUR control software) and contains buttons like 'Run Loop', 'Stop', status indicators, and an activity feed showing messages like 'Capturing screen...', 'Model is thinking...', 'CLICK | ...', 'DONE | ...'.\n\
+⚠ THIS OVERLAY IS NOT PART OF THE DESKTOP. IT IS YOUR OWN HUD.\n\
+  - NEVER click on it (not the buttons, not the text, not anything in it)\n\
+  - NEVER reference it as evidence of task progress or completion\n\
+  - NEVER treat messages like 'Model is thinking...' or 'CLICK | ...' as indicators that the task is done\n\
+  - If you see a blue-glowing border around the screen edges, that is also YOUR overlay — ignore it\n\
+  - Pretend the HUD does not exist. Focus ONLY on the actual desktop content beneath it.\n\n\
+═══ MANDATORY PRE-ACTION CHECKLIST (DO THIS EVERY SINGLE STEP) ═══\n\
+You MUST follow this checklist IN ORDER before choosing ANY action:\n\n\
+STEP 1 — READ APP STATE: Look at the CURRENT OS STATE section in the user message. It tells you:\n\
+  - Frontmost app (which app is active right now)\n\
+  - Window title\n\
+  - App state (e.g. Spotify: playing or paused, browser: current URL)\n\
+  This is GROUND TRUTH about what the system is doing. Trust it over the screenshot.\n\n\
+STEP 2 — IS THE TASK ALREADY DONE? Based on the app state:\n\
+  - If the goal was to pause Spotify and app state says paused → return DONE immediately\n\
+  - If the goal was to open Chrome and frontmost app is Google Chrome → return DONE immediately\n\
+  - If the app state confirms the goal is met → STOP. Do not take another action.\n\n\
+STEP 3 — IS THE RIGHT APP IN FRONT? If the frontmost app is NOT the target app:\n\
+  - Do NOT click, hotkey, or type — you will act on the WRONG app\n\
+  - Your ONLY valid action is: open Spotlight (Cmd+Space) then type app name then press Return\n\
+  - Spotlight sequence must span multiple steps: Cmd+Space, then type, then Return\n\
+  ⚠ AFTER Cmd+Space, your VERY NEXT action MUST be type. Do NOT click ANYTHING.\n\
+  Clicking anywhere dismisses Spotlight. Do NOT click Dock icons or results.\n\
+  Do NOT use Cmd+Tab.\n\n\
+STEP 4 — DID MY LAST ACTION WORK? Check what changed:\n\
+  - Compare the current app state and screenshot to what you did last step\n\
+  - If your last action had NO EFFECT, do NOT repeat it — try a DIFFERENT approach\n\
+  - NEVER repeat the same action twice in a row\n\n\
+STEP 5 — CHOOSE YOUR NEXT ACTION based on all of the above.\n\n\
+═══ WHEN TO STOP (STRICT RULES) ═══\n\
+Return action=none ONLY when ALL of these are true:\n\
+  1. The TARGET APP (not Agenticify) is in the foreground\n\
+  2. The expected result is visible in the TARGET APP's content area\n\
+  3. You have verified the result by examining the actual app UI, NOT the Agenticify HUD overlay\n\
 You are NOT done if:\n\
+  - You see 'Model is thinking...' or 'Capturing screen...' — that is YOUR HUD, not task completion\n\
   - You just opened an app but haven't performed the actual task yet\n\
   - A page is still loading (spinner visible, content not rendered)\n\
-  - You typed a URL but haven't pressed Return to navigate\n\
+  - You typed a URL but haven't pressed Return\n\
   - You opened Spotlight but haven't typed or pressed Return\n\
   - The wrong page/app is showing\n\
   - A dialog, modal, or error is blocking the view\n\
   - You completed step 1 of a multi-step task but not the remaining steps\n\
-ASK YOURSELF: \"If someone looked at this screenshot, would they say the task is done?\" If no, KEEP GOING.\n\
-When uncertain, CONTINUE — you have plenty of steps remaining. Stopping early is worse than taking extra steps.\n\n\
+ASK YOURSELF: \"Ignoring the Agenticify HUD, if someone looked at the TARGET APP, would they say the task is done?\" If no, KEEP GOING.\n\
+When uncertain, CONTINUE — stopping early is worse than taking extra steps.\n\n\
+═══ ACTIONS (return exactly one as JSON) ═══\n\n\
+1. CLICK: {\"action\":\"click\", \"x_norm\":<px_x>, \"y_norm\":<px_y>, \"confidence\":0-1, \"reason\":\"...\"}\n\
+   Pixel coords in the screenshot. (0,0) = top-left. Aim for the exact CENTER of the target element.\n\n\
+2. HOTKEY: {\"action\":\"hotkey\", \"keys\":[{\"key\":\"Meta\",\"direction\":\"press\"},{\"key\":\"Space\",\"direction\":\"click\"},{\"key\":\"Meta\",\"direction\":\"release\"}], \"confidence\":0-1, \"reason\":\"...\"}\n\n\
+3. TYPE: {\"action\":\"type\", \"text\":\"Chrome\", \"confidence\":0-1, \"reason\":\"...\"}\n\
+   Types into whatever field currently has focus. Do NOT click before typing if a field is already focused (e.g. Spotlight).\n\n\
+4. SHELL: {\"action\":\"shell\", \"command\":\"ls -la ~/Desktop\", \"confidence\":0-1, \"reason\":\"...\"}\n\
+   ⚠ Do NOT use shell/CLI unless the user's task EXPLICITLY requires it (e.g. 'run a command', 'check git status', 'install X'). For all other tasks, use GUI actions (click, hotkey, type).\n\n\
+5. DONE: {\"action\":\"none\", \"x_norm\":0, \"y_norm\":0, \"confidence\":0, \"reason\":\"...\"}\n\
+   Use ONLY when the task goal is fully achieved and visually confirmed in the target app.\n\n\
+═══ CLICK ACCURACY ═══\n\
+  - Aim for the exact CENTER of the target element\n\
+  - If a click doesn't work, try a keyboard shortcut instead (preferred)\n\
+  - PREFER arrow keys + Return for menus, lists, dropdowns, search results\n\
+  - Clicking is the LAST RESORT — use keyboard shortcuts whenever possible\n\n\
 ═══ TEXT EDITING ═══\n\
   - Clear field: Cmd+A then type replacement (overwrites selection)\n\
   - Delete: Backspace key\n\
   - Old/wrong text: ALWAYS Cmd+A then retype\n\n\
 ═══ SHELL VS GUI ═══\n\
-  Shell: files, git, packages, builds, system info, scripts\n\
-  GUI: visual tasks, app interactions, web browsing\n\n\
-═══ CLICK ACCURACY ═══\n\
-  - Aim for CENTER of target element\n\
-  - KNOWN BUG: clicks land ABOVE target. Add +20 to +40 to y_norm to compensate.\n\
-  - Missed click? Retry with y_norm increased by 30-50px.\n\
-  - PREFER arrow keys + Return for menus, lists, dropdowns, search results.\n\n\
+  Shell: ONLY when the user explicitly asks for CLI/terminal actions (e.g. files, git, packages, scripts)\n\
+  GUI: EVERYTHING ELSE — app interactions, media control, web browsing, clicking buttons, navigating menus\n\
+  ⚠ DEFAULT TO GUI. Do not use shell commands to control apps (e.g. osascript) unless the user specifically requests CLI.\n\n\
 ═══ GOAL VERIFICATION ═══\n\
   - The browser address bar is ONLY at the very top, next to back/forward/reload buttons\n\
   - A text field inside a page is NOT the address bar even if it shows a URL\n\
-  - Before stopping: What app am I in? What content is visible? Does it match the goal?\n\n\
+  - Before stopping: What app am I in? What content is visible? Does it match the goal?\n\
+  - IGNORE the Agenticify overlay when verifying — look at the actual app underneath\n\n\
 ═══ HOTKEYS ═══\n\
 Browser: Cmd+L address bar | Cmd+T new tab | Cmd+W close tab | Cmd+R reload | Cmd+[ back | Cmd+] forward\n\
 macOS: Cmd+Space Spotlight | Cmd+Q quit | Cmd+A select all | Cmd+C copy | Cmd+V paste | Cmd+S save\n\
 Keys: Meta/Cmd, Tab, Space, Return/Enter, Escape, Shift, Control/Ctrl, Alt/Option, Up, Down, Left, Right, Backspace, Delete, Home, End, PageUp, PageDown, F1-F12, or any character.\n\
 Directions: press (hold), release (let go), click (tap, default).\n\
-ALWAYS prefer app shortcuts > generic hotkeys > clicking.\n\
-Clicking is the LAST RESORT — use it only when no keyboard shortcut exists for the action.\n\
+ALWAYS prefer: hotkeys > app shortcuts > clicking. Only use shell if explicitly asked.\n\
 App-specific shortcuts (if available) will be provided in the user message below.\n\
 Return ONLY valid JSON.";
 
@@ -2108,6 +2214,7 @@ fn main() {
             recording::load_activity_log_cmd,
             get_app_shortcuts_cmd,
             clear_shortcuts_cache_cmd,
+            export_markdown_cmd,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri app");
