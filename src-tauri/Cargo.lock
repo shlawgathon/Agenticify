@@ -66,7 +66,9 @@ dependencies = [
 name = "agenticify"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "core-graphics 0.24.0",
+ "dirs",
  "dotenvy",
  "enigo",
  "image",
@@ -4348,7 +4350,6 @@ dependencies = [
  "base64 0.22.1",
  "bytes 1.11.1",
  "futures-core",
- "futures-util",
  "http 1.4.0",
  "http-body",
  "http-body-util",
@@ -4357,7 +4358,6 @@ dependencies = [
  "hyper-util",
  "js-sys",
  "log",
- "mime_guess",
  "percent-encoding",
  "pin-project-lite",
  "quinn",

@@ -1,8 +1,10 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod recording;
+mod shortcuts;
 
 
+#[allow(unused_imports)]
 use enigo::{Button, Coordinate, Direction, Enigo, Key, Keyboard, Mouse, Settings};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -23,10 +25,10 @@ use tauri_plugin_global_shortcut::{Code, Modifiers, ShortcutState};
 use xcap::Monitor;
 
 const MAX_ACTIONS_PER_RUN: u32 = 30;
-const DEFAULT_MISTRAL_MODEL: &str = "mistralai/ministral-14b-2512";
+const DEFAULT_MISTRAL_MODEL: &str = "mistralai/mistral-large-2512";
 const DEFAULT_MISTRAL_BASE: &str = "https://openrouter.ai/api/v1";
 const DEFAULT_CONFIDENCE_THRESHOLD: f64 = 0.60;
-const DEFAULT_INFER_MAX_DIM: u32 = 1400;
+const DEFAULT_INFER_MAX_DIM: u32 = 2048;
 
 #[derive(Default)]
 struct RuntimeGuards {
@@ -76,6 +78,7 @@ struct CaptureFrame {
 struct InferClickRequest {
     png_path: String,
     instruction: String,
+    #[allow(dead_code)]
     model: Option<String>,
     /// Prior action history for multi-step loops
     #[serde(default)]
@@ -88,6 +91,8 @@ struct ClickRequest {
     y_norm: f64,
     screenshot_w_px: u32,
     screenshot_h_px: u32,
+    sent_w_px: u32,
+    sent_h_px: u32,
     monitor_origin_x_pt: i32,
     monitor_origin_y_pt: i32,
     scale_factor: f64,
@@ -102,6 +107,8 @@ struct VisionAction {
     confidence: f64,
     reason: String,
     model_ms: u128,
+    sent_w: u32,
+    sent_h: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     keys: Option<Vec<KeyAction>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -305,15 +312,18 @@ fn confidence_threshold() -> f64 {
         .unwrap_or(DEFAULT_CONFIDENCE_THRESHOLD)
 }
 
-fn clamp_norm(v: f64) -> f64 {
-    v.max(0.0).min(1000.0)
+fn clamp_pixel(v: f64, max: f64) -> f64 {
+    v.max(0.0).min(max)
 }
 
-fn normalized_to_global_points(req: &ClickRequest) -> (i32, i32) {
-    let x_px =
-        (clamp_norm(req.x_norm) / 1000.0 * (req.screenshot_w_px.saturating_sub(1) as f64)).round();
-    let y_px =
-        (clamp_norm(req.y_norm) / 1000.0 * (req.screenshot_h_px.saturating_sub(1) as f64)).round();
+fn pixel_to_global_points(req: &ClickRequest) -> (i32, i32) {
+    // x_norm/y_norm are pixel coordinates in the SENT (possibly downscaled) image.
+    // Scale them back to original screenshot pixel coordinates, then to screen points.
+    let scale_x = req.screenshot_w_px as f64 / req.sent_w_px.max(1) as f64;
+    let scale_y = req.screenshot_h_px as f64 / req.sent_h_px.max(1) as f64;
+
+    let x_px = clamp_pixel(req.x_norm * scale_x, (req.screenshot_w_px.saturating_sub(1)) as f64);
+    let y_px = clamp_pixel(req.y_norm * scale_y, (req.screenshot_h_px.saturating_sub(1)) as f64);
 
     let x_pt = req.monitor_origin_x_pt as f64 + (x_px / req.scale_factor.max(1.0));
     let y_pt = req.monitor_origin_y_pt as f64 + (y_px / req.scale_factor.max(1.0));
@@ -344,7 +354,7 @@ fn perform_real_click(
         return Err("Max actions reached; E-STOP engaged".to_string());
     }
 
-    let (x_pt, y_pt) = normalized_to_global_points(req);
+    let (x_pt, y_pt) = pixel_to_global_points(req);
     let started = Instant::now();
 
     if let Some(app_handle) = app {
@@ -361,13 +371,47 @@ fn perform_real_click(
         );
     }
 
-    let mut enigo = Enigo::new(&Settings::default()).map_err(|e| e.to_string())?;
-    enigo
-        .move_mouse(x_pt, y_pt, Coordinate::Abs)
-        .map_err(|e| e.to_string())?;
-    enigo
-        .button(Button::Left, Direction::Click)
-        .map_err(|e| e.to_string())?;
+    // Use CGEvent to click without moving the user's physical cursor.
+    // This posts synthetic mouse-down + mouse-up events at the target point,
+    // so the agent can click through overlay windows and the user keeps control.
+    #[cfg(target_os = "macos")]
+    {
+        use core_graphics::event::{CGEvent, CGEventType, CGMouseButton, CGEventTapLocation, EventField};
+        use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
+        use core_graphics::geometry::CGPoint;
+
+        let point = CGPoint::new(x_pt as f64, y_pt as f64);
+        let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
+            .map_err(|_| "Failed to create CGEventSource")?;
+
+        let mouse_down = CGEvent::new_mouse_event(
+            source.clone(),
+            CGEventType::LeftMouseDown,
+            point,
+            CGMouseButton::Left,
+        ).map_err(|_| "Failed to create mouse-down CGEvent")?;
+        mouse_down.set_integer_value_field(EventField::MOUSE_EVENT_CLICK_STATE, 1);
+
+        let mouse_up = CGEvent::new_mouse_event(
+            source,
+            CGEventType::LeftMouseUp,
+            point,
+            CGMouseButton::Left,
+        ).map_err(|_| "Failed to create mouse-up CGEvent")?;
+        mouse_up.set_integer_value_field(EventField::MOUSE_EVENT_CLICK_STATE, 1);
+
+        mouse_down.post(CGEventTapLocation::HID);
+        thread::sleep(Duration::from_millis(30));
+        mouse_up.post(CGEventTapLocation::HID);
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        // Fallback to enigo on non-macOS platforms
+        let mut enigo = Enigo::new(&Settings::default()).map_err(|e| e.to_string())?;
+        enigo.move_mouse(x_pt, y_pt, Coordinate::Abs).map_err(|e| e.to_string())?;
+        enigo.button(Button::Left, Direction::Click).map_err(|e| e.to_string())?;
+    }
 
     if let Some(app_handle) = app {
         let _ = app_handle.emit(
@@ -385,10 +429,17 @@ fn perform_real_click(
 
     let click_ms = started.elapsed().as_millis();
     println!(
-        "[telemetry] click_ms={} point=({}, {}) action_count={}",
+        "[telemetry] click_ms={} point=({}, {}) norm=({:.1}, {:.1}) screenshot={}x{} scale={:.2} monitor_origin=({}, {}) action_count={}",
         click_ms,
         x_pt,
         y_pt,
+        req.x_norm,
+        req.y_norm,
+        req.screenshot_w_px,
+        req.screenshot_h_px,
+        req.scale_factor,
+        req.monitor_origin_x_pt,
+        req.monitor_origin_y_pt,
         n + 1
     );
 
@@ -491,7 +542,7 @@ fn extract_json_payload(text: &str) -> Result<String, String> {
     Err("Could not extract JSON from model response".to_string())
 }
 
-fn parse_vision_action(content: &str, model_ms: u128) -> Result<VisionAction, String> {
+fn parse_vision_action(content: &str, model_ms: u128, sent_w: u32, sent_h: u32) -> Result<VisionAction, String> {
     let json_text = extract_json_payload(content)?;
     let raw: VisionActionRaw = serde_json::from_str(&json_text).map_err(|e| e.to_string())?;
 
@@ -501,8 +552,8 @@ fn parse_vision_action(content: &str, model_ms: u128) -> Result<VisionAction, St
     }
 
     if action == "click" {
-        if !(0.0..=1000.0).contains(&raw.x_norm) || !(0.0..=1000.0).contains(&raw.y_norm) {
-            return Err("x_norm and y_norm must be in [0,1000]".to_string());
+        if raw.x_norm < 0.0 || raw.x_norm > sent_w as f64 || raw.y_norm < 0.0 || raw.y_norm > sent_h as f64 {
+            return Err(format!("x_norm and y_norm must be pixel coordinates within the image (0-{}, 0-{})", sent_w, sent_h));
         }
     }
 
@@ -542,6 +593,8 @@ fn parse_vision_action(content: &str, model_ms: u128) -> Result<VisionAction, St
         confidence: raw.confidence,
         reason: raw.reason,
         model_ms,
+        sent_w,
+        sent_h,
         keys: raw.keys,
         text: raw.text,
         command: raw.command,
@@ -581,45 +634,7 @@ fn load_infer_image_bytes(path: &str) -> Result<(Vec<u8>, u32, u32, u32, u32), S
     Ok((cursor.into_inner(), orig_w, orig_h, new_w, new_h))
 }
 
-async fn upload_temp_image(png_bytes: Vec<u8>) -> Result<String, String> {
-    let client = reqwest::Client::builder()
-        .user_agent("Agenticify/1.0")
-        .build()
-        .map_err(|e| format!("http client error: {}", e))?;
-    let part = reqwest::multipart::Part::bytes(png_bytes)
-        .file_name("screenshot.png")
-        .mime_str("image/png")
-        .map_err(|e| format!("multipart mime error: {}", e))?;
-    let form = reqwest::multipart::Form::new().part("file", part);
 
-    let resp = client
-        .post("https://tmpfiles.org/api/v1/upload")
-        .multipart(form)
-        .send()
-        .await
-        .map_err(|e| format!("image upload failed: {}", e))?;
-
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        return Err(format!("image upload returned {}: {}", status, body));
-    }
-
-    let body: serde_json::Value = resp.json().await.map_err(|e| format!("upload parse error: {}", e))?;
-    let page_url = body
-        .get("data")
-        .and_then(|d| d.get("url"))
-        .and_then(|u| u.as_str())
-        .ok_or_else(|| format!("unexpected upload response: {}", body))?;
-
-    // tmpfiles.org returns a page URL like http://tmpfiles.org/12345/screenshot.png
-    // convert to direct download URL: https://tmpfiles.org/dl/12345/screenshot.png
-    let url = page_url
-        .replacen("tmpfiles.org/", "tmpfiles.org/dl/", 1)
-        .replacen("http://", "https://", 1);
-    println!("[provider] uploaded screenshot -> {}", url);
-    Ok(url)
-}
 
 fn resolve_primary_api_base() -> String {
     std::env::var("OPENROUTER_API_BASE")
@@ -1020,6 +1035,8 @@ async fn replay_recording_session_cmd(
                 y_norm: action.y_norm,
                 screenshot_w_px: width_px,
                 screenshot_h_px: height_px,
+                sent_w_px: action.sent_w,
+                sent_h_px: action.sent_h,
                 monitor_origin_x_pt: monitor.x().map_err(|e| e.to_string())?,
                 monitor_origin_y_pt: monitor.y().map_err(|e| e.to_string())?,
                 scale_factor,
@@ -1116,6 +1133,364 @@ struct FrontmostApp {
     window_title: String,
 }
 
+/// Query app-specific state via AppleScript for scriptable macOS apps.
+/// Returns a human-readable string with the app's internal state, or empty if
+/// the app isn't scriptable or the query fails.
+fn query_app_state(app_name: &str) -> String {
+    let script = match app_name {
+        // ── Media Players ──────────────────────────────────
+        "Spotify" => r#"
+            tell application "Spotify"
+                if it is running then
+                    set pState to player state as string
+                    set tName to name of current track
+                    set tArtist to artist of current track
+                    set tAlbum to album of current track
+                    set pos to player position as integer
+                    set dur to (duration of current track) / 1000 as integer
+                    set vol to sound volume
+                    set shuf to shuffling
+                    set rep to repeating
+                    return pState & " | " & tName & " by " & tArtist & " (" & tAlbum & ") | " & pos & "/" & dur & "s | vol:" & vol & " | shuffle:" & shuf & " | repeat:" & rep
+                end if
+            end tell
+        "#,
+        "Music" => r#"
+            tell application "Music"
+                if it is running then
+                    set pState to player state as string
+                    set tName to name of current track
+                    set tArtist to artist of current track
+                    set pos to player position as integer
+                    set dur to duration of current track as integer
+                    return pState & " | " & tName & " by " & tArtist & " | " & pos & "/" & dur & "s"
+                end if
+            end tell
+        "#,
+        "VLC" => r#"
+            tell application "VLC"
+                if it is running then
+                    try
+                        set pState to playing
+                        set tName to name of current item
+                        return "playing:" & pState & " | " & tName
+                    on error
+                        return "idle"
+                    end try
+                end if
+            end tell
+        "#,
+
+        // ── Browsers ───────────────────────────────────────
+        "Safari" => r#"
+            tell application "Safari"
+                if it is running then
+                    set tabURL to URL of current tab of front window
+                    set tabTitle to name of current tab of front window
+                    set tabCount to count of tabs of front window
+                    return tabTitle & " | " & tabURL & " | tabs:" & tabCount
+                end if
+            end tell
+        "#,
+        "Google Chrome" => r#"
+            tell application "Google Chrome"
+                if it is running then
+                    set tabURL to URL of active tab of front window
+                    set tabTitle to title of active tab of front window
+                    set tabCount to count of tabs of front window
+                    return tabTitle & " | " & tabURL & " | tabs:" & tabCount
+                end if
+            end tell
+        "#,
+        "Arc" => r#"
+            tell application "Arc"
+                if it is running then
+                    try
+                        set tabURL to URL of active tab of front window
+                        set tabTitle to title of active tab of front window
+                        return tabTitle & " | " & tabURL
+                    on error
+                        return ""
+                    end try
+                end if
+            end tell
+        "#,
+        "Firefox" => r#"
+            tell application "System Events"
+                tell process "Firefox"
+                    try
+                        set winTitle to name of front window
+                        return winTitle
+                    on error
+                        return ""
+                    end try
+                end tell
+            end tell
+        "#,
+
+        // ── Productivity ───────────────────────────────────
+        "Preview" => r#"
+            tell application "Preview"
+                if it is running then
+                    set docName to name of front document
+                    return docName
+                end if
+            end tell
+        "#,
+        "TextEdit" => r#"
+            tell application "TextEdit"
+                if it is running then
+                    set docName to name of front document
+                    return docName
+                end if
+            end tell
+        "#,
+        "Notes" => r#"
+            tell application "Notes"
+                if it is running then
+                    try
+                        set noteName to name of first note of default account
+                        return "Latest note: " & noteName
+                    on error
+                        return ""
+                    end try
+                end if
+            end tell
+        "#,
+        "Reminders" | "Calendar" | "Mail" => {
+            // These apps are scriptable but state queries are slow/complex
+            // Just report they're running — the window title is usually enough
+            return String::new();
+        },
+        "Messages" => r#"
+            tell application "System Events"
+                tell process "Messages"
+                    try
+                        return name of front window
+                    on error
+                        return ""
+                    end try
+                end tell
+            end tell
+        "#,
+        "Slack" | "Discord" => r#"
+            tell application "System Events"
+                tell process "{APP}"
+                    try
+                        return name of front window
+                    on error
+                        return ""
+                    end try
+                end tell
+            end tell
+        "#,
+
+        // ── Finder ─────────────────────────────────────────
+        "Finder" => r#"
+            tell application "Finder"
+                try
+                    set folderPath to POSIX path of (target of front Finder window as alias)
+                    set itemCount to count of items of front Finder window
+                    set sel to count of (selection as alias list)
+                    return folderPath & " | items:" & itemCount & " | selected:" & sel
+                on error
+                    return "Desktop"
+                end try
+            end tell
+        "#,
+
+        // ── Terminal ───────────────────────────────────────
+        "Terminal" => r#"
+            tell application "Terminal"
+                if it is running then
+                    set tabProcs to processes of front tab of front window
+                    set AppleScript's text item delimiters to ", "
+                    return tabProcs as text
+                end if
+            end tell
+        "#,
+
+        // ── Unknown apps — try generic focused element ────
+        _ => {
+            let generic_script = format!(
+                r#"tell application "System Events"
+                    tell process "{}"
+                        try
+                            set fe to focused UI element
+                            set feRole to role of fe
+                            set feVal to value of fe
+                            return feRole & ": " & feVal
+                        on error
+                            return ""
+                        end try
+                    end tell
+                end tell"#,
+                app_name
+            );
+            let output = Command::new("osascript")
+                .arg("-e")
+                .arg(&generic_script)
+                .output();
+            return output
+                .ok()
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                .unwrap_or_default();
+        }
+    };
+
+    // For Slack/Discord, substitute {APP} placeholder
+    let final_script = script.replace("{APP}", app_name);
+
+    Command::new("osascript")
+        .arg("-e")
+        .arg(&final_script)
+        .output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default()
+}
+
+/// Gather rich OS context to inject into the agent's prompt.
+/// Returns a formatted string with frontmost app, window title, and running GUI apps.
+fn gather_os_context() -> String {
+    let mut parts: Vec<String> = Vec::new();
+
+    // 1. Frontmost application + window title
+    let frontmost_script = r#"
+        tell application "System Events"
+            set frontApp to name of first application process whose frontmost is true
+            try
+                set winTitle to name of front window of (first application process whose frontmost is true)
+            on error
+                set winTitle to ""
+            end try
+            return frontApp & "|||" & winTitle
+        end tell
+    "#;
+    if let Ok(output) = Command::new("osascript").arg("-e").arg(frontmost_script).output() {
+        let raw = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let segs: Vec<&str> = raw.splitn(2, "|||").collect();
+        let app_name = segs.first().unwrap_or(&"").to_string();
+        let win_title = segs.get(1).unwrap_or(&"").to_string();
+        parts.push(format!("Frontmost app: {}\nWindow title: {}", app_name, win_title));
+    }
+
+    // 2. List of running GUI applications (visible in Dock)
+    let running_apps_script = r#"
+        tell application "System Events"
+            set appList to name of every application process whose background only is false
+            set AppleScript's text item delimiters to ", "
+            return appList as text
+        end tell
+    "#;
+    if let Ok(output) = Command::new("osascript").arg("-e").arg(running_apps_script).output() {
+        let apps = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if !apps.is_empty() {
+            parts.push(format!("Running GUI apps: {}", apps));
+        }
+    }
+
+    // 3. Number of open windows in the frontmost app
+    let window_count_script = r#"
+        tell application "System Events"
+            set frontProc to first application process whose frontmost is true
+            set winCount to count of windows of frontProc
+            set winNames to {}
+            repeat with w in windows of frontProc
+                try
+                    copy name of w to end of winNames
+                end try
+            end repeat
+            set AppleScript's text item delimiters to " | "
+            return (winCount as text) & "|||" & (winNames as text)
+        end tell
+    "#;
+    if let Ok(output) = Command::new("osascript").arg("-e").arg(window_count_script).output() {
+        let raw = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let segs: Vec<&str> = raw.splitn(2, "|||").collect();
+        let count = segs.first().unwrap_or(&"0");
+        let names = segs.get(1).unwrap_or(&"").to_string();
+        if !names.is_empty() {
+            parts.push(format!("Open windows in frontmost app ({}): {}", count, names));
+        }
+    }
+
+    // 4. App-specific state (scriptable apps)
+    // Extract the frontmost app name from our earlier query
+    let frontmost_app_name = parts.first()
+        .and_then(|p| p.strip_prefix("Frontmost app: "))
+        .and_then(|s| s.split('\n').next())
+        .unwrap_or("")
+        .to_string();
+
+    if !frontmost_app_name.is_empty() {
+        let app_state = query_app_state(&frontmost_app_name);
+        if !app_state.is_empty() {
+            parts.push(format!("App state ({}): {}", frontmost_app_name, app_state));
+        }
+    }
+
+    // 5. Current date/time
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    parts.push(format!("System time (unix): {}", now));
+
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!("\n\n═══ CURRENT OS STATE ═══\n{}", parts.join("\n"))
+    }
+}
+
+/// Extract just the frontmost app name (for shortcuts lookup).
+fn extract_frontmost_app_name() -> String {
+    let script = r#"
+        tell application "System Events"
+            set frontApp to name of first application process whose frontmost is true
+            return frontApp
+        end tell
+    "#;
+    Command::new("osascript")
+        .arg("-e")
+        .arg(script)
+        .output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default()
+}
+
+// ── Shortcuts Tauri Commands ───────────────────────────
+
+#[derive(Debug, Clone, Serialize)]
+struct AppShortcuts {
+    app_name: String,
+    shortcuts: String,
+    from_cache: bool,
+}
+
+#[tauri::command]
+async fn get_app_shortcuts_cmd(app_name: String) -> Result<AppShortcuts, String> {
+    let api_key = resolve_primary_api_key();
+    let api_base = resolve_primary_api_base();
+
+    let was_cached = shortcuts::get_cached_global(&app_name).is_some();
+    let text = shortcuts::get_or_fetch_global(&app_name, api_key.trim(), &api_base).await;
+
+    Ok(AppShortcuts {
+        app_name,
+        shortcuts: text,
+        from_cache: was_cached,
+    })
+}
+
+#[tauri::command]
+fn clear_shortcuts_cache_cmd() {
+    shortcuts::clear_global_cache();
+    println!("[shortcuts] global cache cleared");
+}
+
 #[tauri::command]
 fn get_frontmost_app_cmd() -> Result<FrontmostApp, String> {
     let script = r#"
@@ -1155,7 +1530,9 @@ async fn infer_click_cmd(req: InferClickRequest) -> Result<VisionAction, String>
 
     let started = Instant::now();
     let (image_bytes, orig_w, orig_h, sent_w, sent_h) = load_infer_image_bytes(&req.png_path)?;
-    let image_url = upload_temp_image(image_bytes).await?;
+    use base64::Engine;
+    let b64 = base64::engine::general_purpose::STANDARD.encode(&image_bytes);
+    let image_url = format!("data:image/png;base64,{}", b64);
     if (orig_w, orig_h) != (sent_w, sent_h) {
         println!(
             "[telemetry] infer_image downscaled {}x{} -> {}x{} (max_dim={})",
@@ -1168,62 +1545,100 @@ async fn infer_click_cmd(req: InferClickRequest) -> Result<VisionAction, String>
         );
     }
 
-    let system_prompt = "You are a desktop automation agent running in a loop. Each step you see a fresh screenshot and choose ONE action.\n\n\
+    let system_prompt = "You are a desktop automation agent running in a persistent loop. Each step you receive a fresh screenshot and choose ONE action. You have up to 30 steps — USE THEM ALL if needed. Do NOT stop early.\n\n\
 ACTIONS (return exactly one as JSON):\n\n\
-1. CLICK a UI element:\n\
-   {\"action\":\"click\", \"x_norm\":0-1000, \"y_norm\":0-1000, \"confidence\":0-1, \"reason\":\"...\"}\n\n\
-2. HOTKEY (keyboard shortcut):\n\
-   {\"action\":\"hotkey\", \"keys\":[{\"key\":\"Meta\",\"direction\":\"press\"},{\"key\":\"Space\",\"direction\":\"click\"},{\"key\":\"Meta\",\"direction\":\"release\"}], \"confidence\":0-1, \"reason\":\"...\"}\n\n\
-3. TYPE text into the currently focused field:\n\
-   {\"action\":\"type\", \"text\":\"Chrome\", \"confidence\":0-1, \"reason\":\"...\"}\n\n\
-4. SHELL (run a CLI command and get the output — use for file operations, git, installs, scripts, system info):\n\
-   {\"action\":\"shell\", \"command\":\"ls -la ~/Desktop\", \"confidence\":0-1, \"reason\":\"...\"}\n\
-   Shell output is returned to you in the next step's context. Use this when the task involves terminal commands, file manipulation, or anything faster via CLI than clicking through UI.\n\n\
-5. DONE (goal achieved or truly impossible):\n\
-   {\"action\":\"none\", \"x_norm\":0, \"y_norm\":0, \"confidence\":0, \"reason\":\"...\"}\n\n\
-NAVIGATION STRATEGY - To open/switch to an app:\n\
-  Step 1: hotkey Cmd+Space (opens Spotlight)\n\
-  Step 2: type the app name (e.g. Chrome)\n\
-  Step 3: hotkey Return (launches it)\n\
-  This is MORE RELIABLE than Cmd+Tab.\n\n\
-SHELL VS GUI — Choose shell when:\n\
-  - The task involves files, directories, git, package managers, or scripts\n\
-  - Checking system info (disk space, processes, environment variables)\n\
-  - Running build/test commands\n\
-  - Installing or configuring software\n\
-  Use GUI actions (click/hotkey/type) for visual tasks that require interacting with app UIs.\n\n\
-GOAL RECOGNITION (CRITICAL - read carefully):\n\
-- After performing actions, LOOK at the ENTIRE screenshot to verify your progress\n\
-- DO NOT confuse random text fields, input boxes, or form fields that happen to contain a URL with the browser address bar\n\
-- The browser address bar is ONLY at the very top of a Chrome/Safari/Firefox window, next to navigation buttons (back/forward/reload)\n\
-- A text field inside a web page (e.g. a form input, search box, API key name field) is NOT the address bar even if it contains a URL\n\
-- Before declaring done, ask yourself: What app am I actually in? What page content is visible? Does it match the goal?\n\
-- If there are modals, dialogs, or overlays blocking the view, deal with those first (close them or interact with them)\n\
-- Only return action=none when the ENTIRE goal is VISUALLY CONFIRMED complete on screen\n\n\
-Available keys: Meta/Cmd, Tab, Space, Return/Enter, Escape, Shift, Control/Ctrl, Alt/Option, Up, Down, Left, Right, Backspace, Delete, Home, End, PageUp, PageDown, F1-F12, or any single character.\n\
+1. CLICK: {\"action\":\"click\", \"x_norm\":<px_x>, \"y_norm\":<px_y>, \"confidence\":0-1, \"reason\":\"...\"}\n\
+   Pixel coords in the screenshot. (0,0) = top-left.\n\n\
+2. HOTKEY: {\"action\":\"hotkey\", \"keys\":[{\"key\":\"Meta\",\"direction\":\"press\"},{\"key\":\"Space\",\"direction\":\"click\"},{\"key\":\"Meta\",\"direction\":\"release\"}], \"confidence\":0-1, \"reason\":\"...\"}\n\n\
+3. TYPE: {\"action\":\"type\", \"text\":\"Chrome\", \"confidence\":0-1, \"reason\":\"...\"}\n\
+   Types into whatever field currently has focus. Do NOT click before typing if a field is already focused (e.g. Spotlight).\n\n\
+4. SHELL: {\"action\":\"shell\", \"command\":\"ls -la ~/Desktop\", \"confidence\":0-1, \"reason\":\"...\"}\n\
+   Use for files, git, installs, scripts, system info. Output appears in next step's context.\n\n\
+5. DONE: {\"action\":\"none\", \"x_norm\":0, \"y_norm\":0, \"confidence\":0, \"reason\":\"...\"}\n\n\
+═══ SPOTLIGHT / APP SWITCHING (CRITICAL) ═══\n\
+To open ANY app, follow this EXACT sequence across steps:\n\
+  Step A: hotkey Cmd+Space → opens Spotlight. It auto-focuses the search field.\n\
+  Step B: type \"AppName\" → Spotlight is ALREADY focused, just type immediately.\n\
+  Step C: hotkey Return → launches the top result.\n\
+⚠ AFTER Cmd+Space, your VERY NEXT action MUST be \"type\". Do NOT click ANYTHING.\n\
+  Clicking anywhere (buttons, screen, dock) DISMISSES Spotlight and you lose it.\n\
+  Do NOT click on Spotlight results either — just press Return.\n\
+  Do NOT click Dock icons — coordinate accuracy is too unreliable.\n\
+  Do NOT use Cmd+Tab — you cannot see which app is highlighted.\n\n\
+═══ WHEN TO STOP (READ CAREFULLY) ═══\n\
+Return action=none ONLY when the goal is 100% VISUALLY CONFIRMED on screen.\n\
+You are NOT done if:\n\
+  - You just opened an app but haven't performed the actual task yet\n\
+  - A page is still loading (spinner visible, content not rendered)\n\
+  - You typed a URL but haven't pressed Return to navigate\n\
+  - You opened Spotlight but haven't typed or pressed Return\n\
+  - The wrong page/app is showing\n\
+  - A dialog, modal, or error is blocking the view\n\
+  - You completed step 1 of a multi-step task but not the remaining steps\n\
+ASK YOURSELF: \"If someone looked at this screenshot, would they say the task is done?\" If no, KEEP GOING.\n\
+When uncertain, CONTINUE — you have plenty of steps remaining. Stopping early is worse than taking extra steps.\n\n\
+═══ TEXT EDITING ═══\n\
+  - Clear field: Cmd+A then type replacement (overwrites selection)\n\
+  - Delete: Backspace key\n\
+  - Old/wrong text: ALWAYS Cmd+A then retype\n\n\
+═══ SHELL VS GUI ═══\n\
+  Shell: files, git, packages, builds, system info, scripts\n\
+  GUI: visual tasks, app interactions, web browsing\n\n\
+═══ CLICK ACCURACY ═══\n\
+  - Aim for CENTER of target element\n\
+  - KNOWN BUG: clicks land ABOVE target. Add +20 to +40 to y_norm to compensate.\n\
+  - Missed click? Retry with y_norm increased by 30-50px.\n\
+  - PREFER arrow keys + Return for menus, lists, dropdowns, search results.\n\n\
+═══ GOAL VERIFICATION ═══\n\
+  - The browser address bar is ONLY at the very top, next to back/forward/reload buttons\n\
+  - A text field inside a page is NOT the address bar even if it shows a URL\n\
+  - Before stopping: What app am I in? What content is visible? Does it match the goal?\n\n\
+═══ HOTKEYS ═══\n\
+Browser: Cmd+L address bar | Cmd+T new tab | Cmd+W close tab | Cmd+R reload | Cmd+[ back | Cmd+] forward\n\
+macOS: Cmd+Space Spotlight | Cmd+Q quit | Cmd+A select all | Cmd+C copy | Cmd+V paste | Cmd+S save\n\
+Keys: Meta/Cmd, Tab, Space, Return/Enter, Escape, Shift, Control/Ctrl, Alt/Option, Up, Down, Left, Right, Backspace, Delete, Home, End, PageUp, PageDown, F1-F12, or any character.\n\
 Directions: press (hold), release (let go), click (tap, default).\n\
-KEYBOARD SHORTCUTS (PREFER these over clicking menus/buttons — faster and more reliable!):\n\
-Browser (Chrome/Safari/Arc):\n\
-  Cmd+T new tab | Cmd+W close tab | Cmd+L focus address bar | Cmd+N new window\n\
-  Cmd+Shift+T reopen closed tab | Cmd+R reload | Cmd+Shift+R hard reload\n\
-  Cmd+[ back | Cmd+] forward | Cmd+1-9 switch to tab N | Ctrl+Tab next tab\n\
-  Cmd+F find on page | Cmd+Shift+N incognito/private | Cmd+, preferences\n\
-  Cmd+D bookmark | Cmd+Shift+J downloads | Cmd+Y history\n\
-macOS System:\n\
-  Cmd+Space Spotlight | Cmd+Tab switch app | Cmd+Q quit app | Cmd+H hide\n\
-  Cmd+M minimize | Cmd+A select all | Cmd+C copy | Cmd+V paste | Cmd+X cut\n\
-  Cmd+Z undo | Cmd+Shift+Z redo | Cmd+S save | Cmd+P print\n\
-  Cmd+Shift+3 screenshot full | Cmd+Shift+4 area | Cmd+Shift+5 tool\n\
-  Ctrl+Cmd+F fullscreen toggle | Cmd+Option+Esc force quit\n\
-Finder: Cmd+Shift+G go to path | Cmd+Shift+. show hidden | Cmd+Delete trash\n\
-Terminal: Ctrl+C interrupt | Ctrl+A start of line | Ctrl+E end of line\n\
-ALWAYS prefer hotkeys over clicking UI when a shortcut exists.\n\
+ALWAYS prefer app shortcuts > generic hotkeys > clicking.\n\
+Clicking is the LAST RESORT — use it only when no keyboard shortcut exists for the action.\n\
+App-specific shortcuts (if available) will be provided in the user message below.\n\
 Return ONLY valid JSON.";
 
+    // Gather OS context (frontmost app, running apps, window info)
+    let os_context = gather_os_context();
+    let frontmost_app = extract_frontmost_app_name();
+    println!("[telemetry] os_context: {}", os_context.replace('\n', " | "));
+
+    // Fetch app-specific shortcuts (cached after first lookup)
+    let shortcuts_text = if !frontmost_app.is_empty() {
+        let api_key_for_shortcuts = resolve_primary_api_key();
+        let api_base_for_shortcuts = resolve_primary_api_base();
+        shortcuts::get_or_fetch_global(
+            &frontmost_app,
+            api_key_for_shortcuts.trim(),
+            &api_base_for_shortcuts,
+        ).await
+    } else {
+        String::new()
+    };
+
     let mut user_prompt = format!(
-        "Task: {}\nCoordinate space: normalized [0,1000] over the provided screenshot.\nLook at the screenshot carefully. What is the NEXT single action to make progress toward the goal?",
-        req.instruction
+        "Task: {}\nCoordinate system: PIXEL coordinates. The screenshot image is {}x{} pixels wide and tall. (0,0) is the top-left corner. ({},{}) is the bottom-right corner. Return x_norm as the pixel column (0 to {}) and y_norm as the pixel row (0 to {}).{}",
+        req.instruction,
+        sent_w, sent_h,
+        sent_w.saturating_sub(1), sent_h.saturating_sub(1),
+        sent_w.saturating_sub(1), sent_h.saturating_sub(1),
+        os_context
     );
+
+    // Inject app-specific shortcuts if available
+    if !shortcuts_text.is_empty() {
+        user_prompt.push_str(&format!(
+            "\n\n═══ APP-SPECIFIC SHORTCUTS ({}) ═══\n{}\nUse these shortcuts FIRST. Only click if no shortcut exists for the action.",
+            frontmost_app, shortcuts_text
+        ));
+    }
+
+    user_prompt.push_str("\n\nLook at the screenshot carefully. What is the NEXT single action to make progress toward the goal?");
 
     if let Some(ctx) = &req.step_context {
         user_prompt.push_str(&format!("\n\nPrevious actions taken:\n{}", ctx));
@@ -1234,12 +1649,7 @@ Return ONLY valid JSON.";
         return Err("API key is missing. Set OPENROUTER_API_KEY (or MISTRAL_API_KEY).".to_string());
     }
 
-    let model = req
-        .model
-        .as_deref()
-        .filter(|m| !m.trim().is_empty())
-        .unwrap_or(DEFAULT_MISTRAL_MODEL)
-        .to_string();
+    let model = DEFAULT_MISTRAL_MODEL.to_string();
 
     let client = OpenRouterClient::builder()
         .api_key(api_key.trim())
@@ -1277,7 +1687,7 @@ Return ONLY valid JSON.";
         .to_string();
 
     let model_ms = started.elapsed().as_millis();
-    let parsed = parse_vision_action(&content, model_ms)?;
+    let parsed = parse_vision_action(&content, model_ms, sent_w, sent_h)?;
 
     println!(
         "[telemetry] model_ms={} action={} confidence={:.3} provider=openrouter",
@@ -1368,9 +1778,14 @@ fn press_keys_cmd(guards: State<RuntimeGuards>, req: PressKeysRequest) -> Result
         }
     }
 
+    let key_desc: Vec<String> = req.keys.iter().map(|k| {
+        let dir = k.direction.as_deref().unwrap_or("click");
+        format!("{}:{}", k.key, dir)
+    }).collect();
     println!(
-        "[keyboard] executed {} key action(s)",
-        req.keys.len()
+        "[keyboard] executed {} key action(s): {}",
+        req.keys.len(),
+        key_desc.join(" → ")
     );
     Ok(())
 }
@@ -1595,13 +2010,22 @@ fn init_display_scale(display_state: &DisplayState) {
 }
 
 fn main() {
-    if let Err(err) = dotenvy::dotenv() {
-        println!(
-            "[startup] dotenv not loaded (this is okay if env vars are exported): {}",
-            err
-        );
-    } else {
-        println!("[startup] loaded environment from .env");
+    // Try loading .env from multiple locations (first match wins):
+    // 1. CWD/.env (works during `cargo run` / `tauri dev`)
+    // 2. ~/.agenticify.env (works for production .app bundles)
+    let home_env = dirs::home_dir().map(|h| h.join(".agenticify.env"));
+    let loaded = dotenvy::dotenv().ok().map(|p| p.display().to_string())
+        .or_else(|| {
+            home_env.as_ref().and_then(|p| {
+                dotenvy::from_path(p).ok().map(|_| p.display().to_string())
+            })
+        });
+    match loaded {
+        Some(path) => println!("[startup] loaded environment from {}", path),
+        None => println!(
+            "[startup] no .env found (checked CWD and {}). Set env vars directly or create ~/.agenticify.env",
+            home_env.as_ref().map(|p| p.display().to_string()).unwrap_or_default()
+        ),
     }
 
     tauri::Builder::default()
@@ -1609,6 +2033,7 @@ fn main() {
         .manage(DisplayState::default())
         .manage(RecordingState::default())
         .manage(recording::SessionRecordingState::default())
+        .manage(shortcuts::ShortcutsCache::default())
         .setup(|app| {
             let display_state = app.state::<DisplayState>();
             init_display_scale(&display_state);
@@ -1681,6 +2106,8 @@ fn main() {
             recording::delete_session_cmd,
             recording::save_activity_log_cmd,
             recording::load_activity_log_cmd,
+            get_app_shortcuts_cmd,
+            clear_shortcuts_cache_cmd,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri app");

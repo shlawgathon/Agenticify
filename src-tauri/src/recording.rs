@@ -4,11 +4,26 @@ use std::{
     path::PathBuf,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
-        Arc, Mutex,
+        Arc, Mutex, OnceLock,
     },
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
+
+// ── CFRunLoop FFI (macOS) ──────────────────────────────
+// Used to cleanly stop the rdev::listen run‐loop from another thread.
+
+type RawCFRunLoopRef = *mut std::os::raw::c_void;
+
+/// Wrapper so we can send the run‐loop ref across threads.
+pub(crate) struct RunLoopHandle(RawCFRunLoopRef);
+unsafe impl Send for RunLoopHandle {}
+unsafe impl Sync for RunLoopHandle {}
+
+extern "C" {
+    fn CFRunLoopGetCurrent() -> RawCFRunLoopRef;
+    fn CFRunLoopStop(rl: RawCFRunLoopRef);
+}
 use tauri::State;
 use xcap::Monitor;
 
@@ -81,6 +96,7 @@ pub struct ActiveSession {
     pub input_events: Arc<Mutex<Vec<InputEvent>>>,
     pub frame_worker: Option<thread::JoinHandle<()>>,
     pub input_worker: Option<thread::JoinHandle<()>>,
+    pub input_run_loop: Arc<OnceLock<RunLoopHandle>>,
 }
 
 #[derive(Default)]
@@ -170,10 +186,17 @@ pub fn start_session_cmd(
     // ── Input capture worker (rdev) ────────────────────
     let input_stop = Arc::clone(&stop_flag);
     let input_sink = Arc::clone(&input_events);
+    let input_run_loop: Arc<OnceLock<RunLoopHandle>> = Arc::new(OnceLock::new());
+    let input_run_loop_tx = Arc::clone(&input_run_loop);
 
     let input_worker = thread::spawn(move || {
         let stop = input_stop;
         let sink = input_sink;
+
+        // Capture this thread's CFRunLoop *before* rdev::listen enters it,
+        // so stop_session_cmd can call CFRunLoopStop to unblock it.
+        let rl = unsafe { CFRunLoopGetCurrent() };
+        let _ = input_run_loop_tx.set(RunLoopHandle(rl));
 
         // rdev::listen is blocking; we poll `stop_flag` inside the callback
         // and use a thread so we can set the flag from outside.
@@ -279,6 +302,7 @@ pub fn start_session_cmd(
         input_events,
         frame_worker: Some(frame_worker),
         input_worker: Some(input_worker),
+        input_run_loop,
     });
 
     Ok(status)
@@ -307,10 +331,13 @@ pub fn stop_session_cmd(
         let _ = w.join();
     }
 
-    // The rdev listener won't join cleanly (it's blocking),
-    // but setting stop_flag prevents further event writes.
-    // We detach the input worker thread.
-    drop(active.input_worker.take());
+    // Stop the CFRunLoop driving rdev::listen so the thread can exit cleanly
+    if let Some(handle) = active.input_run_loop.get() {
+        unsafe { CFRunLoopStop(handle.0) };
+    }
+    if let Some(w) = active.input_worker.take() {
+        let _ = w.join();
+    }
 
     let finished = now_ms()?;
     let ticks = active.frame_ticks.load(Ordering::SeqCst);

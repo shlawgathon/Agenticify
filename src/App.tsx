@@ -69,6 +69,8 @@ type VisionAction = {
   confidence: number;
   reason: string;
   model_ms: number;
+  sent_w: number;
+  sent_h: number;
   keys?: KeyAction[];
   text?: string;
   command?: string;
@@ -148,7 +150,6 @@ type HudUpdate = {
   keyLoaded: boolean;
   permsReady: boolean;
   instruction: string;
-  hoverMode: boolean;
 };
 
 type HudActionError = {
@@ -163,12 +164,10 @@ const OVERLAY_QUERY_KEY = "overlay";
 const HUD_LABEL = "hud";
 const HUD_QUERY_KEY = "hud";
 const MAIN_LABEL = "main";
-const DEFAULT_HUD_MODEL = "mistralai/ministral-14b-2512";
+const DEFAULT_HUD_MODEL = "mistralai/mistral-large-2512";
 
 const MODEL_OPTIONS = [
-  { id: "mistralai/mistral-large-2512", label: "Mistral Large 3 (Flagship)" },
-  { id: "mistralai/mistral-small-3.1-24b-instruct", label: "Mistral Small 3.1 (24B)" },
-  { id: "mistralai/ministral-14b-2512", label: "Ministral 14B (Default)" },
+  { id: "mistralai/mistral-large-2512", label: "Mistral Large 3" },
 ] as const;
 const HUD_WIDTH = 460;
 const HUD_HEIGHT = 42;
@@ -400,7 +399,7 @@ function OverlayWindow() {
             void getCurrentWindow()
               .hide()
               .catch(() => undefined);
-          }, 1200);
+          }, 3000);
         },
       );
 
@@ -450,18 +449,39 @@ function OverlayWindow() {
     };
   }, []);
 
+  const cursorVisible = cursor.visible || agentActive;
+
   return (
     <main className="overlay-root">
       {agentActive && <div className="agent-glow-border" />}
-      {cursor.visible ? (
+      {cursorVisible && (
         <div
           className={`agent-cursor ${cursor.phase === "click" ? "click" : "move"}`}
           style={{ left: `${cursor.x}px`, top: `${cursor.y}px` }}
         >
-          <span className="agent-cursor-ring" />
+          {/* Pointer arrow SVG */}
+          <svg
+            className="agent-cursor-pointer"
+            viewBox="0 0 24 24"
+            fill="none"
+            xmlns="http://www.w3.org/2000/svg"
+          >
+            <path
+              d="M5 3L19 12L12 13.5L9 21L5 3Z"
+              fill="rgba(60, 140, 255, 0.9)"
+              stroke="rgba(255, 255, 255, 0.95)"
+              strokeWidth="1.5"
+              strokeLinejoin="round"
+            />
+          </svg>
           <span className="agent-cursor-dot" />
+          <span className="agent-cursor-ripple" key={`r1-${cursor.x}-${cursor.y}-${cursor.phase}`} />
+          <span className="agent-cursor-ripple-2" key={`r2-${cursor.x}-${cursor.y}-${cursor.phase}`} />
+          {cursor.phase === "click" && (
+            <span className="agent-cursor-label">Click</span>
+          )}
         </div>
-      ) : null}
+      )}
     </main>
   );
 }
@@ -473,7 +493,6 @@ function HudWindow() {
     keyLoaded: false,
     permsReady: false,
     instruction: "Waiting for command",
-    hoverMode: false,
   });
   const [recordingActive, setRecordingActive] = useState(false);
   const [recordingTicks, setRecordingTicks] = useState(0);
@@ -595,7 +614,7 @@ function HudWindow() {
             monitor_origin_x_pt: captured.monitor_origin_x_pt,
             monitor_origin_y_pt: captured.monitor_origin_y_pt,
             scale_factor: captured.scale_factor,
-            confidence: inferred.confidence,
+            confidence: inferred.confidence, sent_w_px: inferred.sent_w, sent_h_px: inferred.sent_h,
           },
         });
       } else if (inferred.action === "hotkey" && inferred.keys?.length) {
@@ -623,7 +642,9 @@ function HudWindow() {
     loopStopRef.current = false;
     setLooping(true);
     setBusy((b) => ({ ...b, run: true }));
+    setActivityFeed([]);
     const MAX_STEPS = 30;
+    const stepHistory: string[] = [];
     try {
       for (let step = 1; step <= MAX_STEPS; step++) {
         if (loopStopRef.current) break;
@@ -634,6 +655,7 @@ function HudWindow() {
             png_path: captured.png_path,
             instruction: status.instruction || "Click the target button",
             model: hudModel,
+            step_context: [await getWindowContext(), ...stepHistory].filter(Boolean).join("\n") || undefined,
           },
         });
 
@@ -649,21 +671,32 @@ function HudWindow() {
               monitor_origin_x_pt: captured.monitor_origin_x_pt,
               monitor_origin_y_pt: captured.monitor_origin_y_pt,
               scale_factor: captured.scale_factor,
-              confidence: inferred.confidence,
+              confidence: inferred.confidence, sent_w_px: inferred.sent_w, sent_h_px: inferred.sent_h,
             },
           });
+          stepHistory.push(`Step ${step}: click (${inferred.x_norm},${inferred.y_norm}) — ${inferred.reason}`);
         } else if (inferred.action === "hotkey" && inferred.keys?.length) {
           await invoke("press_keys_cmd", {
             req: { keys: inferred.keys, delay_ms: 30 },
           });
+          stepHistory.push(`Step ${step}: hotkey ${inferred.keys.map(k => k.key).join("+")} — ${inferred.reason}`);
         } else if (inferred.action === "type" && inferred.text) {
           await invoke("type_text_cmd", { text: inferred.text });
+          stepHistory.push(`Step ${step}: typed "${inferred.text}" — ${inferred.reason}`);
         } else if (inferred.action === "shell" && inferred.command) {
-          await invoke<string>("run_shell_cmd", { command: inferred.command });
+          const shellOut = await invoke<string>("run_shell_cmd", { command: inferred.command });
+          stepHistory.push(`Step ${step}: shell \`${inferred.command}\` → ${shellOut.slice(0, 200)} — ${inferred.reason}`);
         }
 
-        // Brief pause between steps to let the UI settle
-        await new Promise((r) => setTimeout(r, 800));
+        await emit("agent_step", {
+          phase: inferred.action as AgentStep["phase"],
+          step,
+          max_steps: MAX_STEPS,
+          message: inferred.reason,
+        } satisfies AgentStep).catch(() => undefined);
+
+        // Wait for UI to settle (Spotlight, menus, animations)
+        await new Promise((r) => setTimeout(r, 1200));
       }
     } catch (err) {
       await emit("hud_action_error", {
@@ -673,6 +706,12 @@ function HudWindow() {
     } finally {
       setLooping(false);
       setBusy((b) => ({ ...b, run: false }));
+      await emit("agent_step", {
+        phase: "done",
+        step: 0,
+        max_steps: 30,
+        message: "Agent loop ended",
+      } satisfies AgentStep).catch(() => undefined);
     }
   };
 
@@ -746,7 +785,15 @@ function HudWindow() {
   const replayStopRef = useRef(false);
   const [replaying, setReplaying] = useState(false);
   const [saveRun, setSaveRun] = useState(false);
-  const [hudModel, setHudModel] = useState(() => localStorage.getItem("agenticify-default-model") || DEFAULT_HUD_MODEL);
+  const [hudModel, setHudModel] = useState(() => {
+    const stored = localStorage.getItem("agenticify-default-model");
+    // Migrate old default to flagship
+    if (!stored || stored === "mistralai/ministral-14b-2512" || stored === "mistralai/mistral-small-3.1-24b-instruct") {
+      localStorage.setItem("agenticify-default-model", DEFAULT_HUD_MODEL);
+      return DEFAULT_HUD_MODEL;
+    }
+    return stored;
+  });
 
   const updateHudModel = (m: string) => {
     setHudModel(m);
@@ -774,7 +821,7 @@ function HudWindow() {
     return () => { cancelled = true; if (unlisten) unlisten(); };
   }, []);
 
-  const hudHoverOnly = status.hoverMode;
+
 
   const togglePanel = async (panel: "activity" | "command" | "record") => {
     const win = getCurrentWindow();
@@ -1009,7 +1056,7 @@ function HudWindow() {
               x_norm: inferred.x_norm, y_norm: inferred.y_norm,
               screenshot_w_px: captured.screenshot_w_px, screenshot_h_px: captured.screenshot_h_px,
               monitor_origin_x_pt: captured.monitor_origin_x_pt, monitor_origin_y_pt: captured.monitor_origin_y_pt,
-              scale_factor: captured.scale_factor, confidence: inferred.confidence,
+              scale_factor: captured.scale_factor, confidence: inferred.confidence, sent_w_px: inferred.sent_w, sent_h_px: inferred.sent_h,
             },
           });
           stepHistory.push(`Step ${step}: clicked at (${inferred.x_norm}, ${inferred.y_norm}) — ${inferred.reason}`);
@@ -1103,15 +1150,15 @@ function HudWindow() {
 
   return (
     <main
-      className={`hud-root ${hudPanel !== "none" ? "hud-expanded" : ""} ${hudHoverOnly ? "hud-hover-only" : ""} ${hudCollapsed ? "hud-collapsed" : ""}`}
+      className={`hud-root ${hudPanel !== "none" ? "hud-expanded" : ""} ${hudCollapsed ? "hud-collapsed" : ""}`}
       onClick={suppressDashboard}
     >
       <section
-        className={`hud-pill ${hudPanel !== "none" ? "expanded" : ""} ${hudCollapsed && !hudHoverOnly ? "collapsed" : ""}`}
+        className={`hud-pill ${hudPanel !== "none" ? "expanded" : ""} ${hudCollapsed ? "collapsed" : ""}`}
         onMouseDown={(e) => { if (hudPanel !== "command" && hudPanel !== "record") e.preventDefault(); }}
         title={hudCollapsed ? "Click to expand" : "Agenticify HUD"}
       >
-        {hudCollapsed && !hudHoverOnly ? (
+        {hudCollapsed ? (
           <button
             className="hud-btn hud-btn-icon"
             onClick={() => void toggleCollapse()}
@@ -1417,7 +1464,7 @@ function MainApp() {
   );
   const [overlayEnabled, setOverlayEnabled] = useState(true);
   const [hudEnabled, setHudEnabled] = useState(true);
-  const [hoverMode, setHoverMode] = useState(false);
+
 
   const [permissions, setPermissions] = useState<PermissionState | null>(null);
   const [envStatus, setEnvStatus] = useState<EnvStatus | null>(null);
@@ -1429,7 +1476,7 @@ function MainApp() {
   const [taskContext, setTaskContext] = useState(
     "Goal: complete the task using all available actions — clicking, typing text, keyboard shortcuts (hotkeys), and shell commands.\nAfter using Cmd+Space to open Spotlight, always TYPE the app name, then press Return.\nUse Cmd+Tab to switch apps if the target app is not visible.\nReturn action=none only when the goal is fully achieved.",
   );
-  const [model, setModel] = useState(() => localStorage.getItem("agenticify-default-model") || "mistralai/ministral-14b-2512");
+  const [model, setModel] = useState(DEFAULT_HUD_MODEL);
 
   const updateModel = (m: string) => {
     setModel(m);
@@ -1626,7 +1673,7 @@ function MainApp() {
         permissions?.screen_recording && permissions?.accessibility,
       ),
       instruction: effectiveInstruction,
-      hoverMode,
+
     } satisfies HudUpdate).catch(() => undefined);
   };
 
@@ -1639,7 +1686,7 @@ function MainApp() {
     permissions?.screen_recording,
     permissions?.accessibility,
     effectiveInstruction,
-    hoverMode,
+
   ]);
 
   useEffect(() => {
@@ -1658,7 +1705,7 @@ function MainApp() {
     permissions?.screen_recording,
     permissions?.accessibility,
     effectiveInstruction,
-    hoverMode,
+
   ]);
 
   const bootstrap = async () => {
@@ -1793,7 +1840,7 @@ function MainApp() {
       if (ok) {
         // Re-sync HUD state to the (possibly re-mounted) HUD
         await publishHudUpdate();
-        await emit("hud_hover_mode", hoverMode).catch(() => undefined);
+
       }
       pushLog(ok ? "top HUD enabled" : "top HUD failed");
       return;
@@ -1956,7 +2003,7 @@ function MainApp() {
             monitor_origin_x_pt: captured.monitor_origin_x_pt,
             monitor_origin_y_pt: captured.monitor_origin_y_pt,
             scale_factor: captured.scale_factor,
-            confidence: inferred.confidence,
+            confidence: inferred.confidence, sent_w_px: inferred.sent_w, sent_h_px: inferred.sent_h,
           },
         });
         pushLog("one-shot click executed");
@@ -2044,7 +2091,7 @@ function MainApp() {
                 x_norm: inferred.x_norm, y_norm: inferred.y_norm,
                 screenshot_w_px: captured.screenshot_w_px, screenshot_h_px: captured.screenshot_h_px,
                 monitor_origin_x_pt: captured.monitor_origin_x_pt, monitor_origin_y_pt: captured.monitor_origin_y_pt,
-                scale_factor: captured.scale_factor, confidence: inferred.confidence,
+                scale_factor: captured.scale_factor, confidence: inferred.confidence, sent_w_px: inferred.sent_w, sent_h_px: inferred.sent_h,
               },
             });
             stepHistory.push(`Step ${step}: clicked at (${inferred.x_norm}, ${inferred.y_norm}) — ${inferred.reason}`);
@@ -2237,7 +2284,7 @@ function MainApp() {
               x_norm: inferred.x_norm, y_norm: inferred.y_norm,
               screenshot_w_px: captured.screenshot_w_px, screenshot_h_px: captured.screenshot_h_px,
               monitor_origin_x_pt: captured.monitor_origin_x_pt, monitor_origin_y_pt: captured.monitor_origin_y_pt,
-              scale_factor: captured.scale_factor, confidence: inferred.confidence,
+              scale_factor: captured.scale_factor, confidence: inferred.confidence, sent_w_px: inferred.sent_w, sent_h_px: inferred.sent_h,
             },
           });
           stepHistory.push(`Step ${step}: click (${inferred.x_norm},${inferred.y_norm}) — ${inferred.reason}`);
@@ -2296,7 +2343,7 @@ function MainApp() {
       <header className="top card">
         <div>
           <h1>Agenticify</h1>
-          <p className="muted">OS-native vision automation with real clicks</p>
+          <p className="muted">OS-native vision automation with hotkey, terminal, and physical gestures.</p>
         </div>
         <div className="row" style={{ alignItems: "center", gap: "8px" }}>
           <select
@@ -2308,16 +2355,7 @@ function MainApp() {
               <option key={m.id} value={m.id}>{m.label}</option>
             ))}
           </select>
-          <button
-            onClick={() => {
-              const next = !hoverMode;
-              setHoverMode(next);
-              void emit("hud_hover_mode", next);
-            }}
-            style={hoverMode ? { borderColor: 'rgba(61,207,145,0.72)', background: 'var(--accent-soft)' } : undefined}
-          >
-            {hoverMode ? "Hover Mode ✓" : "Hover Mode"}
-          </button>
+
           <button onClick={() => setDarkMode((v) => !v)}>
             {darkMode ? "Light Mode" : "Dark Mode"}
           </button>

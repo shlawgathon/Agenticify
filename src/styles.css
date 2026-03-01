@@ -652,65 +652,156 @@ code {
   stroke-linejoin: round;
 }
 
+/* ── Animated Agent Pointer ────────────────── */
+/* Smooth-gliding pointer cursor like ChatGPT Atlas */
+
 .agent-cursor {
   position: absolute;
-  width: 26px;
-  height: 26px;
-  margin-left: -13px;
-  margin-top: -13px;
+  pointer-events: none;
+  z-index: 10000;
+  transition: left 350ms cubic-bezier(0.22, 1, 0.36, 1), top 350ms cubic-bezier(0.22, 1, 0.36, 1);
+  will-change: left, top;
+}
+
+/* The pointer icon — a glowing cursor arrow */
+.agent-cursor-pointer {
+  width: 24px;
+  height: 24px;
+  filter: drop-shadow(0 0 8px rgba(60, 140, 255, 0.8)) drop-shadow(0 0 20px rgba(60, 140, 255, 0.4));
+  transition: filter 150ms ease;
+}
+
+.agent-cursor.click .agent-cursor-pointer {
+  filter: drop-shadow(0 0 12px rgba(255, 100, 100, 0.9)) drop-shadow(0 0 25px rgba(255, 100, 100, 0.5));
+}
+
+/* Glowing dot at the pointer tip */
+.agent-cursor-dot {
+  position: absolute;
+  left: 3px;
+  top: 2px;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #3c8cff;
+  box-shadow:
+    0 0 0 2px rgba(255, 255, 255, 0.9),
+    0 0 12px rgba(60, 140, 255, 0.9);
+  transition: background 150ms ease, box-shadow 150ms ease;
+}
+
+.agent-cursor.click .agent-cursor-dot {
+  background: #ff6464;
+  box-shadow:
+    0 0 0 2px rgba(255, 255, 255, 0.9),
+    0 0 16px rgba(255, 100, 100, 0.9);
+}
+
+/* Click ripple expanding outward */
+.agent-cursor-ripple {
+  position: absolute;
+  left: 3px;
+  top: 2px;
+  width: 8px;
+  height: 8px;
+  margin-left: -0px;
+  margin-top: -0px;
+  border-radius: 50%;
+  border: 2px solid rgba(60, 140, 255, 0.8);
+  opacity: 0;
   pointer-events: none;
 }
 
-.agent-cursor-dot {
-  position: absolute;
-  left: 50%;
-  top: 50%;
-  width: 10px;
-  height: 10px;
-  border-radius: 50%;
-  transform: translate(-50%, -50%);
-  background: #00e1ff;
-  box-shadow:
-    0 0 0 2px rgba(255, 255, 255, 0.85),
-    0 0 20px rgba(0, 225, 255, 0.9);
+.agent-cursor.click .agent-cursor-ripple {
+  animation: pointer-ripple 0.6s ease-out;
 }
 
-.agent-cursor-ring {
-  position: absolute;
-  inset: 0;
-  border-radius: 50%;
-  border: 2px solid rgba(0, 225, 255, 0.92);
-}
-
-.agent-cursor.move .agent-cursor-ring {
-  animation: ring-pulse 1.2s ease-out infinite;
-}
-
-.agent-cursor.click .agent-cursor-ring {
-  border-color: rgba(255, 110, 110, 0.95);
-  animation: click-burst 0.35s ease-out;
-}
-
-@keyframes ring-pulse {
+@keyframes pointer-ripple {
   0% {
-    transform: scale(0.8);
-    opacity: 0.95;
-  }
-  100% {
-    transform: scale(1.45);
-    opacity: 0;
-  }
-}
-
-@keyframes click-burst {
-  0% {
-    transform: scale(0.8);
+    transform: scale(1);
     opacity: 1;
+    border-color: rgba(255, 100, 100, 0.9);
   }
   100% {
-    transform: scale(1.8);
+    transform: scale(5);
     opacity: 0;
+    border-color: rgba(255, 100, 100, 0.3);
   }
+}
+
+/* Second ripple ring, delayed */
+.agent-cursor-ripple-2 {
+  position: absolute;
+  left: 3px;
+  top: 2px;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  border: 1.5px solid rgba(60, 140, 255, 0.6);
+  opacity: 0;
+  pointer-events: none;
+}
+
+.agent-cursor.click .agent-cursor-ripple-2 {
+  animation: pointer-ripple-2 0.6s ease-out 0.1s;
+}
+
+@keyframes pointer-ripple-2 {
+  0% {
+    transform: scale(1);
+    opacity: 0.8;
+    border-color: rgba(255, 100, 100, 0.7);
+  }
+  100% {
+    transform: scale(4);
+    opacity: 0;
+    border-color: rgba(255, 100, 100, 0.1);
+  }
+}
+
+/* Subtle pulsing glow while moving */
+.agent-cursor.move .agent-cursor-dot {
+  animation: pointer-glow 1.5s ease-in-out infinite;
+}
+
+@keyframes pointer-glow {
+  0%, 100% {
+    box-shadow:
+      0 0 0 2px rgba(255, 255, 255, 0.9),
+      0 0 12px rgba(60, 140, 255, 0.9);
+  }
+  50% {
+    box-shadow:
+      0 0 0 3px rgba(255, 255, 255, 0.7),
+      0 0 20px rgba(60, 140, 255, 0.6),
+      0 0 40px rgba(60, 140, 255, 0.3);
+  }
+}
+
+/* Label showing what's happening */
+.agent-cursor-label {
+  position: absolute;
+  left: 28px;
+  top: 4px;
+  white-space: nowrap;
+  font-size: 11px;
+  font-weight: 600;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  color: #fff;
+  background: rgba(30, 58, 95, 0.92);
+  border: 1px solid rgba(60, 140, 255, 0.5);
+  border-radius: 6px;
+  padding: 2px 8px;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
+  pointer-events: none;
+  opacity: 0;
+  transform: translateX(-4px);
+  transition: opacity 200ms ease, transform 200ms ease;
+}
+
+.agent-cursor.click .agent-cursor-label {
+  opacity: 1;
+  transform: translateX(0);
 }
 
 @media (max-width: 1080px) {
@@ -752,46 +843,6 @@ code {
   align-items: flex-start;
   padding-top: 4px;
 }
-
-/* ── Hover-only mode: pill collapses to a dot, expands on hover ── */
-/* Only collapse when no panel is open (pill not expanded) */
-
-.hud-root.hud-hover-only .hud-pill:not(.expanded) {
-  width: 18px;
-  height: 18px;
-  min-width: 18px;
-  max-width: 18px;
-  max-height: 18px;
-  border-radius: 50%;
-  overflow: hidden;
-  padding: 0;
-  justify-content: center;
-  align-items: center;
-}
-
-.hud-root.hud-hover-only .hud-pill:not(.expanded) > * {
-  pointer-events: none;
-  opacity: 0;
-}
-
-.hud-root.hud-hover-only .hud-pill:not(.expanded):hover {
-  width: 460px;
-  height: 42px;
-  max-width: 460px;
-  max-height: 300px;
-  min-width: 460px;
-  border-radius: 18px;
-  padding: 6px 10px;
-  justify-content: flex-start;
-  align-items: stretch;
-  overflow: visible;
-}
-
-.hud-root.hud-hover-only .hud-pill:not(.expanded):hover > * {
-  pointer-events: auto;
-  opacity: 1;
-}
-
 
 
 .hud-dropdown {
@@ -933,6 +984,7 @@ code {
 /* ── Dashboard Model Activity ───────────────────── */
 
 .model-activity {
+  max-height: 320px;
   overflow-y: auto;
   display: flex;
   flex-direction: column;
