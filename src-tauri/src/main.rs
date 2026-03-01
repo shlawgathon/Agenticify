@@ -1639,13 +1639,13 @@ GATE 1 — OBJECTIVE CHECK (HIGHEST PRIORITY):\n\
   Look at the screenshot AND the CURRENT OS STATE in the user message.\n\
   The OS state tells you: frontmost app, window title, app-specific state (e.g. Spotify playing/paused).\n\
   Ask: Has the objective been achieved?\n\
-  → YES: Return {"action":"none", "x_norm":0, "y_norm":0, "confidence":1, "reason":"Objective achieved: [describe what you see confirming it]"} IMMEDIATELY. Do not take any other action.\n\
+  → YES: Return {\\"action\\":\\"none\\", \\"x_norm\\":0, \\"y_norm\\":0, \\"confidence\\":1, \\"reason\\":\\"Objective achieved: [describe what you see confirming it]\\"} IMMEDIATELY. Do not take any other action.\n\
   → NO: Proceed to Gate 2.\n\
   Examples of DONE states:\n\
-    - Task: "pause Spotify" → App state shows paused, or you see the pause button changed to play → DONE\n\
-    - Task: "open Chrome" → Frontmost app is Google Chrome → DONE\n\
-    - Task: "go to google.com" → Browser shows google.com loaded → DONE\n\
-    - Task: "close this window" → The window is no longer visible → DONE\n\n\
+    - Task: \"pause Spotify\" → App state shows paused, or you see the pause button changed to play → DONE\n\
+    - Task: \"open Chrome\" → Frontmost app is Google Chrome → DONE\n\
+    - Task: \"go to google.com\" → Browser shows google.com loaded → DONE\n\
+    - Task: \"close this window\" → The window is no longer visible → DONE\n\n\
 GATE 2 — CORRECT APP CHECK:\n\
   Is the frontmost app (from OS state) the TARGET app for your task?\n\
   → NO: Use Spotlight to switch apps. Cmd+Space → type app name → Return. Do NOT click/hotkey/type anything else.\n\
