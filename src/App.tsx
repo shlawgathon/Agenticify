@@ -581,7 +581,7 @@ function HudWindow() {
         req: {
           png_path: captured.png_path,
           instruction: status.instruction || "Click the target button",
-          model: DEFAULT_HUD_MODEL,
+          model: hudModel,
         },
       });
 
@@ -633,7 +633,7 @@ function HudWindow() {
           req: {
             png_path: captured.png_path,
             instruction: status.instruction || "Click the target button",
-            model: DEFAULT_HUD_MODEL,
+            model: hudModel,
           },
         });
 
@@ -746,6 +746,12 @@ function HudWindow() {
   const replayStopRef = useRef(false);
   const [replaying, setReplaying] = useState(false);
   const [saveRun, setSaveRun] = useState(false);
+  const [hudModel, setHudModel] = useState(() => localStorage.getItem("agenticify-default-model") || DEFAULT_HUD_MODEL);
+
+  const updateHudModel = (m: string) => {
+    setHudModel(m);
+    localStorage.setItem("agenticify-default-model", m);
+  };
 
   const pushActivity = (step: AgentStep) => {
     setActivityFeed((f) => [...f.slice(-30), stampStep(step)]);
@@ -780,7 +786,7 @@ function HudWindow() {
       await win.setMinSize(new LogicalSize(HUD_WIDTH, HUD_HEIGHT)).catch(() => undefined);
     } else {
       setHudPanel(panel);
-      const h = panel === "activity" ? 180 : panel === "record" ? 240 : 200;
+      const h = panel === "activity" ? 180 : panel === "record" ? (selectedSession ? 280 : 220) : 200;
       await win.setFocusable(panel === "command" || panel === "record").catch(() => undefined);
       await win.setMinSize(new LogicalSize(HUD_WIDTH, h)).catch(() => undefined);
       await win.setMaxSize(new LogicalSize(HUD_WIDTH, h)).catch(() => undefined);
@@ -811,6 +817,18 @@ function HudWindow() {
     }
   }, [hudPanel]);
 
+  // Resize record panel when session selection changes
+  useEffect(() => {
+    if (hudPanel !== "record") return;
+    const h = selectedSession ? 280 : 220;
+    const win = getCurrentWindow();
+    void (async () => {
+      await win.setMinSize(new LogicalSize(HUD_WIDTH, h)).catch(() => undefined);
+      await win.setMaxSize(new LogicalSize(HUD_WIDTH, h)).catch(() => undefined);
+      await win.setSize(new LogicalSize(HUD_WIDTH, h)).catch(() => undefined);
+    })();
+  }, [selectedSession, hudPanel]);
+
   useEffect(() => {
     if (!recActive) return;
     const id = window.setInterval(() => void refreshRecSession(), 500);
@@ -824,7 +842,7 @@ function HudWindow() {
           name: recSessionName.trim() || undefined,
           instruction: recInstruction.trim() || undefined,
           task_context: hudContext.trim() || undefined,
-          model: DEFAULT_HUD_MODEL,
+          model: hudModel,
           fps: 2,
         },
       });
@@ -874,7 +892,7 @@ function HudWindow() {
             req: {
               png_path: captured.png_path,
               instruction: inst,
-              model: DEFAULT_HUD_MODEL,
+              model: hudModel,
               step_context: [await getWindowContext(), ...stepHistory].filter(Boolean).join("\n") || undefined,
             },
           });
@@ -947,7 +965,7 @@ function HudWindow() {
             name: `Run: ${inst.slice(0, 40)}`,
             instruction: inst,
             task_context: hudContext.trim() || undefined,
-            model: DEFAULT_HUD_MODEL,
+            model: hudModel,
             fps: 2,
           },
         });
@@ -973,7 +991,7 @@ function HudWindow() {
           req: {
             png_path: captured.png_path,
             instruction: inst,
-            model: DEFAULT_HUD_MODEL,
+            model: hudModel,
             step_context: [await getWindowContext(), ...stepHistory].filter(Boolean).join("\n") || undefined,
           },
         });
@@ -1054,6 +1072,7 @@ function HudWindow() {
     setHudCollapsed(true);
     setHudPanel("none");
     const w = 48, h = 48;
+    await win.setFocusable(false).catch(() => undefined);
     await win.setMinSize(new LogicalSize(w, h)).catch(() => undefined);
     await win.setMaxSize(new LogicalSize(w, h)).catch(() => undefined);
     await win.setSize(new LogicalSize(w, h)).catch(() => undefined);
@@ -1237,6 +1256,17 @@ function HudWindow() {
               value={hudContext}
               onChange={(e) => setHudContext(e.target.value)}
             />
+            <div style={{ display: "flex", alignItems: "center", gap: "6px" }}>
+              <select
+                value={hudModel}
+                onChange={(e) => updateHudModel(e.target.value)}
+                style={{ fontSize: "0.48rem", fontWeight: 400, padding: "1px 14px 1px 4px", height: "16px", minHeight: 0, background: "rgba(15,23,42,0.5)", color: "rgba(226,232,240,0.6)", border: "1px solid rgba(170,214,255,0.1)", borderRadius: "4px", flex: 1, backgroundImage: "url(\"data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='8' height='8' viewBox='0 0 12 12'%3E%3Cpath fill='%2364748b' d='M2 4l4 4 4-4'/%3E%3C/svg%3E\")", backgroundRepeat: "no-repeat", backgroundPosition: "right 4px center" }}
+              >
+                {MODEL_OPTIONS.map((m) => (
+                  <option key={m.id} value={m.id}>{m.label}</option>
+                ))}
+              </select>
+            </div>
             <div className="hud-input-actions">
               <button
                 className="hud-btn"
@@ -1282,6 +1312,17 @@ function HudWindow() {
                   value={recInstruction}
                   onChange={(e) => setRecInstruction(e.target.value)}
                 />
+                <div style={{ display: "flex", alignItems: "center", gap: "6px" }}>
+                  <select
+                    value={hudModel}
+                    onChange={(e) => updateHudModel(e.target.value)}
+                    style={{ fontSize: "0.48rem", fontWeight: 400, padding: "1px 14px 1px 4px", height: "16px", minHeight: 0, background: "rgba(15,23,42,0.5)", color: "rgba(226,232,240,0.6)", border: "1px solid rgba(170,214,255,0.1)", borderRadius: "4px", flex: 1, backgroundImage: "url(\"data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='8' height='8' viewBox='0 0 12 12'%3E%3Cpath fill='%2364748b' d='M2 4l4 4 4-4'/%3E%3C/svg%3E\")", backgroundRepeat: "no-repeat", backgroundPosition: "right 4px center" }}
+                  >
+                    {MODEL_OPTIONS.map((m) => (
+                      <option key={m.id} value={m.id}>{m.label}</option>
+                    ))}
+                  </select>
+                </div>
                 <div className="hud-input-actions">
                   <button className="hud-btn" onClick={() => void startSession()}>● Record</button>
                 </div>
@@ -1295,7 +1336,14 @@ function HudWindow() {
                             key={s.session_id}
                             className={`hud-btn ${selectedSession?.session_id === s.session_id ? "active" : ""}`}
                             style={{ fontSize: "0.5rem", textAlign: "left", padding: "3px 6px" }}
-                            onClick={() => setSelectedSession(selectedSession?.session_id === s.session_id ? null : s)}
+                            onClick={() => {
+                              if (selectedSession?.session_id === s.session_id) {
+                                setSelectedSession(null);
+                              } else {
+                                setSelectedSession(s);
+                                if (s.model) setHudModel(s.model);
+                              }
+                            }}
                           >
                             {s.name} — {formatDuration(Number(s.duration_ms))}
                           </button>
@@ -1303,14 +1351,14 @@ function HudWindow() {
                       </div>
                     </div>
                     {selectedSession && (
-                      <div style={{ display: "flex", alignItems: "center", gap: "4px", marginTop: "2px" }}>
+                      <div style={{ display: "flex", alignItems: "center", gap: "4px", marginTop: "2px", flexWrap: "wrap" }}>
                         <button
                           className="hud-btn"
                           disabled={replaying || busy.run}
                           onClick={() => void replaySession()}
                           style={{ fontSize: "0.52rem" }}
                         >
-                          {replaying ? "Replaying..." : "▶ Replay"}
+                            {replaying ? "Replaying..." : "▶ Replay"}
                         </button>
                         {replaying && (
                           <button
@@ -1321,6 +1369,15 @@ function HudWindow() {
                             ■ Stop
                           </button>
                         )}
+                        <select
+                          value={hudModel}
+                          onChange={(e) => updateHudModel(e.target.value)}
+                          style={{ fontSize: "0.46rem", padding: "2px 3px", background: "rgba(15,23,42,0.7)", color: "rgba(226,232,240,0.9)", border: "1px solid rgba(170,214,255,0.15)", borderRadius: "3px", maxWidth: "100px" }}
+                        >
+                          {MODEL_OPTIONS.map((m) => (
+                            <option key={m.id} value={m.id}>{m.label}</option>
+                          ))}
+                        </select>
                         <span style={{ fontSize: "0.48rem", color: "rgba(226,232,240,0.6)" }}>×</span>
                         {infiniteRepeat ? (
                           <button className="hud-btn active" onClick={() => setInfiniteRepeat(false)} style={{ fontSize: "0.52rem", padding: "2px 5px" }}>∞</button>
@@ -1372,7 +1429,12 @@ function MainApp() {
   const [taskContext, setTaskContext] = useState(
     "Goal: complete the task using all available actions — clicking, typing text, keyboard shortcuts (hotkeys), and shell commands.\nAfter using Cmd+Space to open Spotlight, always TYPE the app name, then press Return.\nUse Cmd+Tab to switch apps if the target app is not visible.\nReturn action=none only when the goal is fully achieved.",
   );
-  const [model, setModel] = useState("mistralai/ministral-14b-2512");
+  const [model, setModel] = useState(() => localStorage.getItem("agenticify-default-model") || "mistralai/ministral-14b-2512");
+
+  const updateModel = (m: string) => {
+    setModel(m);
+    localStorage.setItem("agenticify-default-model", m);
+  };
 
   const [recordingStatus, setRecordingStatus] =
     useState<RecordingStatus | null>(null);
@@ -2236,7 +2298,16 @@ function MainApp() {
           <h1>Agenticify</h1>
           <p className="muted">OS-native vision automation with real clicks</p>
         </div>
-        <div className="row">
+        <div className="row" style={{ alignItems: "center", gap: "8px" }}>
+          <select
+            value={model}
+            onChange={(e) => updateModel(e.target.value)}
+            style={{ fontSize: "0.75rem", padding: "5px 8px", background: "rgba(15,23,42,0.7)", color: "rgba(226,232,240,0.9)", border: "1px solid rgba(170,214,255,0.15)", borderRadius: "6px" }}
+          >
+            {MODEL_OPTIONS.map((m) => (
+              <option key={m.id} value={m.id}>{m.label}</option>
+            ))}
+          </select>
           <button
             onClick={() => {
               const next = !hoverMode;
@@ -2337,7 +2408,7 @@ function MainApp() {
                   Model
                   <select
                     value={model}
-                    onChange={(e) => setModel(e.target.value)}
+                    onChange={(e) => updateModel(e.target.value)}
                   >
                     {MODEL_OPTIONS.map((m) => (
                       <option key={m.id} value={m.id}>{m.label}</option>
@@ -2503,7 +2574,7 @@ function MainApp() {
                       Model
                       <select
                         value={model}
-                        onChange={(e) => setModel(e.target.value)}
+                        onChange={(e) => updateModel(e.target.value)}
                       >
                         {MODEL_OPTIONS.map((m) => (
                           <option key={m.id} value={m.id}>{m.label}</option>
