@@ -1669,6 +1669,10 @@ function MainApp() {
           return false;
         });
       setHudEnabled(ok);
+      if (ok) {
+        // Re-sync hover mode state to the (possibly re-mounted) HUD
+        await emit("hud_hover_mode", hoverMode).catch(() => undefined);
+      }
       pushLog(ok ? "top HUD enabled" : "top HUD failed");
       return;
     }
@@ -2158,16 +2162,6 @@ function MainApp() {
           <p className="muted">OS-native vision automation with real clicks</p>
         </div>
         <div className="row">
-          <button onClick={() => {
-            const newVal = !hudEnabled;
-            void setHud(newVal);
-            if (!newVal) {
-              setHoverMode(false);
-              void emit("hud_hover_mode", false);
-            }
-          }}>
-            {hudEnabled ? "Hide Top HUD" : "Show Top HUD"}
-          </button>
           <button
             onClick={() => {
               const next = !hoverMode;
