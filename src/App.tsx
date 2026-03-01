@@ -138,6 +138,7 @@ type HudUpdate = {
   keyLoaded: boolean;
   permsReady: boolean;
   instruction: string;
+  hoverMode: boolean;
 };
 
 type HudActionError = {
@@ -154,7 +155,7 @@ const HUD_QUERY_KEY = "hud";
 const MAIN_LABEL = "main";
 const DEFAULT_HUD_MODEL = "mistralai/ministral-14b-2512";
 const HUD_WIDTH = 460;
-const HUD_HEIGHT = 48;
+const HUD_HEIGHT = 42;
 
 const FLOW = [
   "UI calls `capture_primary_cmd`; Rust captures the primary display and writes a PNG in temp storage.",
@@ -290,6 +291,7 @@ async function ensureHudWindow(): Promise<WebviewWindow> {
     focus: true,
     resizable: false,
     shadow: false,
+    acceptFirstMouse: true,
     x,
     y,
     width,
@@ -456,6 +458,7 @@ function HudWindow() {
     keyLoaded: false,
     permsReady: false,
     instruction: "Waiting for command",
+    hoverMode: false,
   });
   const [recordingActive, setRecordingActive] = useState(false);
   const [recordingTicks, setRecordingTicks] = useState(0);
@@ -708,7 +711,6 @@ function HudWindow() {
     })();
   };
 
-  const [hudHoverOnly, setHudHoverOnly] = useState(false);
   const [hudCollapsed, setHudCollapsed] = useState(false);
 
   const [hudPanel, setHudPanel] = useState<"none" | "activity" | "command" | "record">("none");
@@ -751,15 +753,7 @@ function HudWindow() {
     return () => { cancelled = true; if (unlisten) unlisten(); };
   }, []);
 
-  useEffect(() => {
-    let unlisten: (() => void) | undefined;
-    void (async () => {
-      unlisten = await listen<boolean>("hud_hover_mode", ({ payload }) => {
-        setHudHoverOnly(payload);
-      });
-    })();
-    return () => { if (unlisten) unlisten(); };
-  }, []);
+  const hudHoverOnly = status.hoverMode;
 
   const togglePanel = async (panel: "activity" | "command" | "record") => {
     const win = getCurrentWindow();
@@ -771,7 +765,7 @@ function HudWindow() {
       await win.setMinSize(new LogicalSize(HUD_WIDTH, HUD_HEIGHT)).catch(() => undefined);
     } else {
       setHudPanel(panel);
-      const h = panel === "activity" ? 180 : panel === "record" ? 280 : 200;
+      const h = panel === "activity" ? 180 : panel === "record" ? 155 : 200;
       await win.setFocusable(panel === "command" || panel === "record").catch(() => undefined);
       await win.setMinSize(new LogicalSize(HUD_WIDTH, h)).catch(() => undefined);
       await win.setMaxSize(new LogicalSize(HUD_WIDTH, h)).catch(() => undefined);
@@ -1042,11 +1036,11 @@ function HudWindow() {
       onClick={suppressDashboard}
     >
       <section
-        className={`hud-pill ${hudPanel !== "none" ? "expanded" : ""} ${hudCollapsed ? "collapsed" : ""}`}
+        className={`hud-pill ${hudPanel !== "none" ? "expanded" : ""} ${hudCollapsed && !hudHoverOnly ? "collapsed" : ""}`}
         onMouseDown={(e) => { if (hudPanel !== "command" && hudPanel !== "record") e.preventDefault(); }}
         title={hudCollapsed ? "Click to expand" : "Agenticify HUD"}
       >
-        {hudCollapsed ? (
+        {hudCollapsed && !hudHoverOnly ? (
           <button
             className="hud-btn hud-btn-icon"
             onClick={() => void toggleCollapse()}
@@ -1508,6 +1502,7 @@ function MainApp() {
         permissions?.screen_recording && permissions?.accessibility,
       ),
       instruction: effectiveInstruction,
+      hoverMode,
     } satisfies HudUpdate).catch(() => undefined);
   };
 
@@ -1520,6 +1515,7 @@ function MainApp() {
     permissions?.screen_recording,
     permissions?.accessibility,
     effectiveInstruction,
+    hoverMode,
   ]);
 
   useEffect(() => {
@@ -1538,6 +1534,7 @@ function MainApp() {
     permissions?.screen_recording,
     permissions?.accessibility,
     effectiveInstruction,
+    hoverMode,
   ]);
 
   const bootstrap = async () => {
@@ -1670,7 +1667,8 @@ function MainApp() {
         });
       setHudEnabled(ok);
       if (ok) {
-        // Re-sync hover mode state to the (possibly re-mounted) HUD
+        // Re-sync HUD state to the (possibly re-mounted) HUD
+        await publishHudUpdate();
         await emit("hud_hover_mode", hoverMode).catch(() => undefined);
       }
       pushLog(ok ? "top HUD enabled" : "top HUD failed");
