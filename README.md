@@ -60,7 +60,7 @@ Every inference call assembles a rich prompt from **7 distinct sources** — thi
 
 ### Model
 
-Uses **Mistral Large 3** (`mistralai/mistral-large-2512`) via the Mistral API for all vision inference. OpenRouter is also supported as an alternative provider.
+Uses **Mistral Large 3** (`mistralai/mistral-large-2512`) via the Mistral API for all vision inference.
 
 - Model selection persists across sessions via `localStorage`.
 - Saved sessions remember which model was used and auto-select it on replay.
@@ -211,8 +211,8 @@ session-<unix-ms>/
 | Mouse Click         | `core-graphics` CGEvent (virtual cursor)  |
 | Keyboard Actuation  | `enigo`                                   |
 | Input Event Capture | `rdev` (global mouse/keyboard listener)   |
-| Vision Model        | Mistral API (OpenRouter also supported)   |
-| HTTP Client         | `reqwest` + `openrouter-rs`               |
+| Vision Model        | Mistral API                               |
+| HTTP Client         | `reqwest`                                 |
 | AI Guardrails       | WhiteCircle API (input/output protection) |
 | Styling             | Vanilla CSS with glassmorphism, dark mode |
 
@@ -221,13 +221,8 @@ session-<unix-ms>/
 Create `.env` in repo root:
 
 ```bash
-# Mistral API (primary)
 MISTRAL_API_KEY=YOUR_MISTRAL_API_KEY
 MISTRAL_API_BASE=https://api.mistral.ai/v1
-
-# Or use OpenRouter instead
-# OPENROUTER_API_KEY=YOUR_OPENROUTER_KEY
-# OPENROUTER_API_BASE=https://openrouter.ai/api/v1
 
 AGENT_CONFIDENCE_THRESHOLD=0.60
 AGENT_INFER_MAX_DIM=2048
