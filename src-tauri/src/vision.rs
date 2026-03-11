@@ -1,7 +1,7 @@
 use crate::{
     models::{InferClickRequest, InferenceUsage, KeyAction, VisionAction, VisionActionRaw},
     os_context::gather_os_context_snapshot,
-    shortcuts, DEFAULT_INFER_MAX_DIM, DEFAULT_MISTRAL_MODEL,
+    shortcuts, DEFAULT_INFER_MAX_DIM, DEFAULT_MODEL,
 };
 use openrouter_rs::types::{
     completion::{ResponseUsage, ToolCall},
@@ -110,12 +110,6 @@ fn modifier_press_release(
 
 fn built_in_shortcut_tools() -> Vec<ShortcutToolSpec> {
     vec![
-        shortcut_tool(
-            "browser_focus_address_bar",
-            "Focus the browser address bar.",
-            "Cmd+L",
-            modifier_press_release(&["Meta"], "l", Some("click")),
-        ),
         shortcut_tool(
             "browser_new_tab",
             "Open a new browser tab.",
@@ -629,6 +623,8 @@ fn build_vision_action(
     sent_h: u32,
     model: String,
     provider: Option<String>,
+    tool_name: Option<String>,
+    shortcut: Option<String>,
     usage: InferenceUsage,
     keys: Option<Vec<KeyAction>>,
     text: Option<String>,
@@ -645,6 +641,8 @@ fn build_vision_action(
         sent_h,
         model,
         provider,
+        tool_name,
+        shortcut,
         usage,
         keys,
         text,
@@ -692,6 +690,8 @@ fn parse_tool_action(
                 sent_h,
                 model,
                 provider,
+                Some("click_target".to_string()),
+                None,
                 usage,
                 None,
                 None,
@@ -716,6 +716,8 @@ fn parse_tool_action(
                 sent_h,
                 model,
                 provider,
+                Some("type_text".to_string()),
+                None,
                 usage,
                 None,
                 Some(args.text),
@@ -740,6 +742,8 @@ fn parse_tool_action(
                 sent_h,
                 model,
                 provider,
+                Some("run_shell".to_string()),
+                None,
                 usage,
                 None,
                 None,
@@ -759,6 +763,8 @@ fn parse_tool_action(
                 sent_h,
                 model,
                 provider,
+                Some("task_done".to_string()),
+                None,
                 usage,
                 None,
                 None,
@@ -787,6 +793,8 @@ fn parse_tool_action(
                 sent_h,
                 model,
                 provider,
+                Some(tool_name.to_string()),
+                Some(shortcut.shortcut.clone()),
                 usage,
                 Some(shortcut.keys.clone()),
                 None,
@@ -870,6 +878,8 @@ fn parse_vision_action_json(
         sent_h,
         model,
         provider,
+        None,
+        None,
         usage,
         raw.keys,
         raw.text,
@@ -881,7 +891,7 @@ fn resolve_model(requested: Option<&str>) -> String {
     requested
         .map(str::trim)
         .filter(|model| !model.is_empty())
-        .unwrap_or(DEFAULT_MISTRAL_MODEL)
+        .unwrap_or(DEFAULT_MODEL)
         .to_string()
 }
 
@@ -995,6 +1005,41 @@ fn estimate_inference_cost(
         + pricing.request
 }
 
+/// Fallback pricing when OpenRouter API is unavailable.
+/// Returns approximate per-token pricing for known models.
+fn fallback_model_pricing(model_id: &str) -> ModelPricing {
+    let lower = model_id.to_lowercase();
+    // Pricing per token (not per million) — divide standard $/M rates by 1_000_000
+    let (prompt, completion) = if lower.contains("gpt-4o") && !lower.contains("mini") {
+        (2.5e-6, 10.0e-6)   // GPT-4o: $2.50/$10 per M
+    } else if lower.contains("gpt-4o-mini") {
+        (0.15e-6, 0.60e-6)  // GPT-4o-mini: $0.15/$0.60 per M
+    } else if lower.contains("gpt-4.1") {
+        (2.0e-6, 8.0e-6)    // GPT-4.1: ~$2/$8 per M
+    } else if lower.contains("gpt-5") {
+        (2.0e-6, 8.0e-6)    // GPT-5: ~$2/$8 per M (estimate)
+    } else if lower.contains("claude-3.5-sonnet") || lower.contains("claude-3-5-sonnet") {
+        (3.0e-6, 15.0e-6)   // Claude 3.5 Sonnet: $3/$15 per M
+    } else if lower.contains("claude-sonnet-4") {
+        (3.0e-6, 15.0e-6)   // Claude Sonnet 4: $3/$15 per M
+    } else if lower.contains("gemini-2") || lower.contains("gemini-pro") {
+        (1.25e-6, 5.0e-6)   // Gemini 2: ~$1.25/$5 per M
+    } else if lower.contains("mistral-large") {
+        (2.0e-6, 6.0e-6)    // Mistral Large: $2/$6 per M
+    } else if lower.contains("llama") {
+        (0.80e-6, 0.80e-6)  // Llama: ~$0.80/$0.80 per M
+    } else {
+        (3.0e-6, 15.0e-6)   // Default: ~$3/$15 per M (conservative)
+    };
+
+    ModelPricing {
+        prompt,
+        completion,
+        image: 0.003,  // ~$0.003 per image
+        request: 0.0,
+    }
+}
+
 fn infer_max_dim() -> u32 {
     std::env::var("AGENT_INFER_MAX_DIM")
         .ok()
@@ -1058,66 +1103,7 @@ pub async fn infer_click_cmd(req: InferClickRequest) -> Result<VisionAction, Str
         );
     }
 
-    let system_prompt = "You are a desktop automation agent running on macOS. Each step you receive a fresh screenshot of the entire screen and must choose EXACTLY ONE tool call. Do not return JSON. Do not narrate. Call one tool only.\n\n\
-═══ COMPUTER USE HUD OVERLAY (CRITICAL — READ FIRST) ═══\n\
-There is a small transparent overlay bar at the TOP CENTER of the screen. It belongs to Computer Use (YOUR control software) and contains buttons like 'Run Loop', 'Stop', status indicators, and an activity feed showing messages like 'Capturing screen...', 'Model is thinking...', 'CLICK | ...', 'DONE | ...'.\n\
-⚠ THIS OVERLAY IS NOT PART OF THE DESKTOP. IT IS YOUR OWN HUD.\n\
-  - NEVER click on it (not the buttons, not the text, not anything in it)\n\
-  - NEVER reference it as evidence of task progress or completion\n\
-  - NEVER treat messages like 'Model is thinking...' or 'CLICK | ...' as indicators that the task is done\n\
-  - If you see a blue-glowing border around the screen edges, that is also YOUR overlay — ignore it\n\
-  - Pretend the HUD does not exist. Focus ONLY on the actual desktop content beneath it.\n\n\
-═══ MANDATORY DECISION FLOW (FOLLOW THIS EVERY SINGLE STEP) ═══\n\
-Before choosing ANY action, you MUST follow these gates in order. STOP at the first gate that applies.\n\n\
-GATE 1 — OBJECTIVE CHECK (HIGHEST PRIORITY):\n\
-  Look at the screenshot AND the CURRENT OS STATE in the user message.\n\
-  The OS state tells you: frontmost app, window title, app-specific state (e.g. Spotify playing/paused).\n\
-  Ask: Has the objective been achieved?\n\
-  → YES: Call the task_done tool immediately with a reason describing what confirms the objective.\n\
-  → NO: Proceed to Gate 2.\n\
-  Examples of DONE states:\n\
-    - Task: \"pause Spotify\" → App state shows paused, or you see the pause button changed to play → DONE\n\
-    - Task: \"open Chrome\" → Frontmost app is Google Chrome → DONE\n\
-    - Task: \"go to google.com\" → Browser shows google.com loaded → DONE\n\
-    - Task: \"close this window\" → The window is no longer visible → DONE\n\n\
-GATE 2 — CORRECT APP CHECK:\n\
-  Is the frontmost app (from OS state) the TARGET app for your task?\n\
-  → NO: Use the system_open_spotlight tool, then on the following step use type_text with the app name, then usually press_return.\n\
-  → YES: Proceed to Gate 3.\n\n\
-GATE 3 — LAST ACTION REVIEW:\n\
-  Look at your step history. Did your last action have the intended effect?\n\
-  → NO EFFECT: Do NOT repeat it. Choose a DIFFERENT approach.\n\
-  → WORKED: Proceed to Gate 4.\n\
-  → FIRST STEP: Proceed to Gate 4.\n\n\
-GATE 4 — CHOOSE NEXT ACTION:\n\
-  Pick the single best tool call to make progress. Prefer named shortcut tools over clicking.\n\n\
-⚠ Spotlight rules: After system_open_spotlight, your VERY NEXT action MUST be type_text. Do NOT click ANYTHING.\n\
-  Clicking dismisses Spotlight. Do NOT click Dock icons or results. Do NOT use Cmd+Tab.\n\n\
-═══ TOOLS ═══\n\
-Use click_target for mouse clicks with pixel coordinates.\n\
-Use type_text for typed input into the focused control.\n\
-Use run_shell ONLY when the user explicitly asked for CLI or terminal work.\n\
-Use task_done ONLY when the goal is visually confirmed.\n\
-For keyboard actions, use the named shortcut tools. Do NOT describe raw key sequences yourself.\n\n\
-═══ CLICK ACCURACY ═══\n\
-  - Aim for the exact CENTER of the target element\n\
-  - If a click doesn't work, try a shortcut tool instead (preferred)\n\
-  - Prefer arrow-key tools plus press_return for menus, lists, dropdowns, and search results\n\
-  - Clicking is the LAST RESORT — use shortcut tools whenever possible\n\n\
-═══ TEXT EDITING ═══\n\
-  - Clear field: use edit_select_all, then type_text replacement\n\
-  - Delete: use press_backspace\n\
-  - Old/wrong text: ALWAYS edit_select_all, then retype\n\n\
-═══ SHELL VS GUI ═══\n\
-  Shell: ONLY when the user explicitly asks for CLI/terminal actions (e.g. files, git, packages, scripts)\n\
-  GUI: EVERYTHING ELSE — app interactions, media control, web browsing, clicking buttons, navigating menus\n\
-  ⚠ DEFAULT TO GUI. Do not use shell commands to control apps (e.g. osascript) unless the user specifically requests CLI.\n\n\
-═══ GOAL VERIFICATION ═══\n\
-  - The browser address bar is ONLY at the very top, next to back/forward/reload buttons\n\
-  - A text field inside a page is NOT the address bar even if it shows a URL\n\
-  - Before stopping: What app am I in? What content is visible? Does it match the goal?\n\
-  - IGNORE the Computer Use overlay when verifying — look at the actual app underneath\n\n\
-ALWAYS prefer: shortcut tools > clicking. Only use run_shell if explicitly asked.";
+    let system_prompt = include_str!("system_prompt.txt");
 
     let os_context = gather_os_context_snapshot();
     let frontmost_app = os_context.frontmost_app_name.clone();
@@ -1246,6 +1232,10 @@ ALWAYS prefer: shortcut tools > clicking. Only use run_shell if explicitly asked
         .flatten()
     {
         usage.estimated_cost_usd = Some(estimate_inference_cost(&usage, &pricing, 1));
+    } else {
+        // Fallback: estimate cost from known model pricing (per token, not per M)
+        let fallback = fallback_model_pricing(&response.model);
+        usage.estimated_cost_usd = Some(estimate_inference_cost(&usage, &fallback, 1));
     }
     let prompt_tokens = usage.prompt_tokens.unwrap_or(usage.estimated_prompt_tokens);
     let completion_tokens = usage
@@ -1377,7 +1367,7 @@ mod tests {
             img.save(&path)?;
 
             let requested_model = env::var("OPENROUTER_TEST_MODEL")
-                .unwrap_or_else(|_| crate::DEFAULT_MISTRAL_MODEL.to_string());
+                .unwrap_or_else(|_| crate::DEFAULT_MODEL.to_string());
 
             let result = infer_click_cmd(InferClickRequest {
                 png_path: path.to_string_lossy().to_string(),
