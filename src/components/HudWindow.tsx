@@ -1,20 +1,16 @@
-// ── HudWindow — Floating HUD Pill ──────────────────────
+// ── HudWindow — Floating Chat Bar (Pluely-inspired) ──────
 
-import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { emit, listen } from "@tauri-apps/api/event";
 import { currentMonitor, getCurrentWindow, LogicalPosition, LogicalSize } from "@tauri-apps/api/window";
 import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
+import gsap from "gsap";
 import { ElapsedTimer, ActivityFeed, stampStep, type TimestampedStep, type AgentStep } from "../HudWidgets";
 import type {
-  CaptureFrame,
   EnvStatus,
-  HudActionError,
   HudUpdate,
   PermissionState,
-  SessionManifest,
-  SessionStatus,
-  VisionAction,
 } from "../types";
 import {
   DEFAULT_HUD_MODEL,
@@ -22,21 +18,20 @@ import {
   HUD_WIDTH,
   MAIN_LABEL,
   MODEL_OPTIONS,
-  OVERLAY_LABEL,
 } from "../constants";
 import {
-  ensureOverlayWindow,
-  formatDuration,
-  getWindowContext,
   revealMainWindow,
 } from "../lib/tauri";
-import {
-  executeInferredAction,
-  buildStepHistoryEntry,
-  runAgentLoop,
-} from "../lib/agentRunner";
+import { runAgentLoop, summarizeRunCost } from "../lib/agentRunner";
+import type { VisionAction, SavedRun } from "../types";
+
+// ── Constants ─────────────────────────────────────
+const COLLAPSED_SIZE = 30;
+const BAR_H = 60;
+const EXPANDED_H = 248;
 
 export function HudWindow() {
+  // ── Core state ─────────────────────────────────
   const [status, setStatus] = useState<HudUpdate>({
     estop: false,
     overlay: true,
@@ -44,27 +39,97 @@ export function HudWindow() {
     permsReady: false,
     instruction: "Waiting for command",
   });
-  const [recordingActive, setRecordingActive] = useState(false);
-  const [recordingTicks, setRecordingTicks] = useState(0);
-  const [busy, setBusy] = useState({
-    start: false,
-    stop: false,
-    run: false,
-  });
   const loopStopRef = useRef(false);
-  const [looping, setLooping] = useState(false);
   const hudIsSourceRef = useRef(false);
+  const [looping, setLooping] = useState(false);
+  const loopingRef = useRef(false);
 
-  const refreshRecordingState = async () => {
-    try {
-      const rs = await invoke<SessionStatus>("session_status_cmd");
-      setRecordingActive(rs.active);
-      setRecordingTicks(rs.frame_ticks);
-    } catch {
-      // best-effort for HUD
+  // ── Panel state ────────────────────────────────
+  const [hudCollapsed, setHudCollapsed] = useState(false);
+  const [showActivity, setShowActivity] = useState(false);
+  const [activityFeed, setActivityFeed] = useState<TimestampedStep[]>([]);
+  const [hudInstruction, setHudInstruction] = useState("");
+  const [paused, setPaused] = useState(false);
+  const pausedRef = useRef(false);
+  const [redirectInput, setRedirectInput] = useState("");
+  const instructionRef = useRef("");
+  const redirectInputRef = useRef<HTMLInputElement>(null);
+  const lastRunStepsRef = useRef<VisionAction[]>([]);
+  const [hasUnsavedRun, setHasUnsavedRun] = useState(false);
+  const activityEndRef = useRef<HTMLDivElement>(null);
+  const [windowBlurred, setWindowBlurred] = useState(false);
+
+  // Detect window focus/blur to compensate for macOS dropping backdrop-filter
+  // and to restore correct window dimensions on focus return (e.g. after Spotlight)
+  useEffect(() => {
+    const onBlur = () => setWindowBlurred(true);
+    const onFocus = () => {
+      setWindowBlurred(false);
+      // Restore correct window size on focus return — macOS may have
+      // disrupted the window when Spotlight or another system overlay opened.
+      if (loopingRef.current || showActivity) {
+        void setWindowSizeCentered(HUD_WIDTH, EXPANDED_H);
+      } else if (!hudCollapsed) {
+        void setWindowSizeCentered(HUD_WIDTH, BAR_H);
+      }
+    };
+    window.addEventListener("blur", onBlur);
+    window.addEventListener("focus", onFocus);
+    return () => {
+      window.removeEventListener("blur", onBlur);
+      window.removeEventListener("focus", onFocus);
+    };
+  }, [showActivity, hudCollapsed]);
+
+  // ── Model selection ────────────────────────────
+  const [hudModel, setHudModel] = useState(() => {
+    const stored = localStorage.getItem("computer-use-default-model");
+    const validIds = MODEL_OPTIONS.map((m) => m.id) as readonly string[];
+    if (!stored || !validIds.includes(stored)) {
+      localStorage.setItem("computer-use-default-model", DEFAULT_HUD_MODEL);
+      return DEFAULT_HUD_MODEL;
     }
+    return stored;
+  });
+
+  const updateHudModel = (m: string) => {
+    setHudModel(m);
+    localStorage.setItem("computer-use-default-model", m);
   };
 
+  // ── Refs for GSAP ──────────────────────────────
+  const pillRef = useRef<HTMLDivElement>(null);
+  const panelRef = useRef<HTMLDivElement>(null);
+  const inputRef = useRef<HTMLInputElement>(null);
+
+  // ── Activity push ──────────────────────────────
+  const pushActivity = useCallback((step: AgentStep) => {
+    setActivityFeed((f) => [...f.slice(-40), stampStep(step)]);
+    // Only scroll if window is focused — avoid layout reflows during macOS app deactivation
+    if (!document.hidden) {
+      setTimeout(() => activityEndRef.current?.scrollIntoView({ behavior: "smooth" }), 50);
+    }
+  }, []);
+
+  // ── Helper: set window size + center on monitor ─
+  const setWindowSizeCentered = async (w: number, h: number) => {
+    const win = getCurrentWindow();
+    const monitor = await currentMonitor();
+    const scale = monitor?.scaleFactor || 1;
+    const monX = monitor ? monitor.position.x / scale : 0;
+    const monW = monitor ? monitor.size.width / scale : 1400;
+    const monY = monitor ? monitor.position.y / scale : 0;
+    const x = monX + monW / 2 - w / 2;
+    const y = monY + 18;
+
+    const size = new LogicalSize(w, h);
+    await win.setMinSize(size).catch(() => undefined);
+    await win.setMaxSize(size).catch(() => undefined);
+    await win.setSize(size).catch(() => undefined);
+    await win.setPosition(new LogicalPosition(x, y)).catch(() => undefined);
+  };
+
+  // ── Boot ───────────────────────────────────────
   useLayoutEffect(() => {
     document.documentElement.classList.add("hud-window");
     document.body.classList.add("hud-window");
@@ -79,15 +144,16 @@ export function HudWindow() {
 
     void (async () => {
       const win = getCurrentWindow();
-      await win.setSize(new LogicalSize(HUD_WIDTH, HUD_HEIGHT)).catch(() => undefined);
-      await win.setMaxSize(new LogicalSize(HUD_WIDTH, HUD_HEIGHT)).catch(() => undefined);
-      await win.setMinSize(new LogicalSize(HUD_WIDTH, HUD_HEIGHT)).catch(() => undefined);
       await win.show().catch(() => undefined);
       await win.setAlwaysOnTop(true).catch(() => undefined);
       await win.setDecorations(false).catch(() => undefined);
       await win.setShadow(false).catch(() => undefined);
       await win.setFocusable(true).catch(() => undefined);
+      await win.setIgnoreCursorEvents(false).catch(() => undefined);
       await win.setBackgroundColor({ red: 0, green: 0, blue: 0, alpha: 0 }).catch(() => undefined);
+
+      // Set initial size centered
+      await setWindowSizeCentered(HUD_WIDTH, BAR_H);
 
       unlistenStatus = await listen<HudUpdate>("hud_update", ({ payload }) => {
         setStatus(payload);
@@ -107,332 +173,174 @@ export function HudWindow() {
         // best-effort
       }
 
-      await refreshRecordingState();
+      // Entrance animation
+      if (pillRef.current) {
+        gsap.fromTo(
+          pillRef.current,
+          { opacity: 0, y: -20, scale: 0.9 },
+          { opacity: 1, y: 0, scale: 1, duration: 0.5, ease: "back.out(1.7)" },
+        );
+      }
     })();
 
-    const id = window.setInterval(() => {
-      void refreshRecordingState();
-    }, 1000);
-
     return () => {
-      window.clearInterval(id);
       if (unlistenStatus) unlistenStatus();
     };
   }, []);
 
-  // ── HUD panel state ──────────────────────────
-
-  const [hudCollapsed, setHudCollapsed] = useState(false);
-  const [hudPanel, setHudPanel] = useState<"none" | "activity" | "command" | "record">("none");
-  const [activityFeed, setActivityFeed] = useState<TimestampedStep[]>([]);
-  const [hudInstruction, setHudInstruction] = useState("");
-  const [hudContext, setHudContext] = useState("");
-  const activityEndRef = useRef<HTMLDivElement>(null);
-
-  // ── Record panel state ──────────────────────────
-  const [recSessionName, setRecSessionName] = useState("");
-  const [recInstruction, setRecInstruction] = useState("");
-  const [recActive, setRecActive] = useState(false);
-  const [recElapsed, setRecElapsed] = useState(0);
-  const [savedSessions, setSavedSessions] = useState<SessionManifest[]>([]);
-  const [selectedSession, setSelectedSession] = useState<SessionManifest | null>(null);
-  const [repeatCount, setRepeatCount] = useState(1);
-  const [infiniteRepeat, setInfiniteRepeat] = useState(false);
-  const replayStopRef = useRef(false);
-  const [replaying, setReplaying] = useState(false);
-  const [saveRun, setSaveRun] = useState(false);
-  const [hudModel, setHudModel] = useState(() => {
-    const stored = localStorage.getItem("computer-use-default-model");
-    if (!stored || stored === "mistralai/ministral-14b-2512" || stored === "mistralai/mistral-small-3.1-24b-instruct") {
-      localStorage.setItem("computer-use-default-model", DEFAULT_HUD_MODEL);
-      return DEFAULT_HUD_MODEL;
-    }
-    return stored;
-  });
-
-  const updateHudModel = (m: string) => {
-    setHudModel(m);
-    localStorage.setItem("computer-use-default-model", m);
-  };
-
-  const pushActivity = (step: AgentStep) => {
-    setActivityFeed((f) => [...f.slice(-30), stampStep(step)]);
-    setTimeout(() => activityEndRef.current?.scrollIntoView({ behavior: "smooth" }), 50);
-  };
-
+  // ── Listen for agent_step events ──────────────
   useEffect(() => {
     let cancelled = false;
     let unlisten: (() => void) | undefined;
     void (async () => {
       unlisten = await listen<AgentStep>("agent_step", ({ payload }) => {
         if (cancelled) return;
-        // Skip if the HUD itself is the source (already pushed via onStep callback)
         if (hudIsSourceRef.current) return;
         pushActivity(payload);
-        if (payload.phase !== "done" && payload.phase !== "error") {
-          setHudPanel((p) => p === "none" ? "activity" : p);
-        }
+        setShowActivity(true);
       });
     })();
     return () => { cancelled = true; if (unlisten) unlisten(); };
-  }, []);
+  }, [pushActivity]);
 
-  // ── Panel toggling ──────────────────────────────
+  // ── Activity toggle with smooth GSAP ───────────
+  const toggleActivity = async () => {
+    if (showActivity) {
+      // ── CLOSE: animate height + content in sync ──
+      const proxy = { h: EXPANDED_H };
+      await new Promise<void>((resolve) => {
+        const tl = gsap.timeline({ onComplete: resolve });
 
-  const togglePanel = async (panel: "activity" | "command" | "record") => {
-    const win = getCurrentWindow();
-    if (hudPanel === panel) {
-      setHudPanel("none");
-      await win.setFocusable(false).catch(() => undefined);
-      await win.setSize(new LogicalSize(HUD_WIDTH, HUD_HEIGHT)).catch(() => undefined);
-      await win.setMaxSize(new LogicalSize(HUD_WIDTH, HUD_HEIGHT)).catch(() => undefined);
-      await win.setMinSize(new LogicalSize(HUD_WIDTH, HUD_HEIGHT)).catch(() => undefined);
-    } else {
-      setHudPanel(panel);
-      const h = panel === "activity" ? 180 : panel === "record" ? (selectedSession ? 280 : 220) : 200;
-      await win.setFocusable(panel === "command" || panel === "record").catch(() => undefined);
-      await win.setMinSize(new LogicalSize(HUD_WIDTH, h)).catch(() => undefined);
-      await win.setMaxSize(new LogicalSize(HUD_WIDTH, h)).catch(() => undefined);
-      await win.setSize(new LogicalSize(HUD_WIDTH, h)).catch(() => undefined);
-    }
-  };
-
-  // ── Record panel helpers ────────────────────────
-
-  const refreshSessions = async () => {
-    try {
-      const list = await invoke<SessionManifest[]>("list_sessions_cmd");
-      setSavedSessions(list);
-    } catch { /* best-effort */ }
-  };
-
-  const refreshRecSession = async () => {
-    try {
-      const s = await invoke<SessionStatus>("session_status_cmd");
-      setRecActive(s.active);
-      setRecElapsed(s.elapsed_ms ?? 0);
-    } catch { /* best-effort */ }
-  };
-
-  useEffect(() => {
-    if (hudPanel === "record") {
-      void refreshSessions();
-      void refreshRecSession();
-    }
-  }, [hudPanel]);
-
-  useEffect(() => {
-    if (hudPanel !== "record") return;
-    const h = selectedSession ? 280 : 220;
-    const win = getCurrentWindow();
-    void (async () => {
-      await win.setMinSize(new LogicalSize(HUD_WIDTH, h)).catch(() => undefined);
-      await win.setMaxSize(new LogicalSize(HUD_WIDTH, h)).catch(() => undefined);
-      await win.setSize(new LogicalSize(HUD_WIDTH, h)).catch(() => undefined);
-    })();
-  }, [selectedSession, hudPanel]);
-
-  useEffect(() => {
-    if (!recActive) return;
-    const id = window.setInterval(() => void refreshRecSession(), 500);
-    return () => window.clearInterval(id);
-  }, [recActive]);
-
-  const startSession = async () => {
-    try {
-      await invoke("start_session_cmd", {
-        req: {
-          name: recSessionName.trim() || undefined,
-          instruction: recInstruction.trim() || undefined,
-          task_context: hudContext.trim() || undefined,
-          model: hudModel,
-          fps: 2,
-        },
-      });
-      setRecActive(true);
-    } catch (err) {
-      await emit("hud_action_error", { action: "session_start", message: String(err) }).catch(() => undefined);
-    }
-  };
-
-  const stopSession = async () => {
-    try {
-      await invoke<SessionManifest>("stop_session_cmd");
-      setRecActive(false);
-      setRecSessionName("");
-      setRecInstruction("");
-      void refreshSessions();
-    } catch (err) {
-      await emit("hud_action_error", { action: "session_stop", message: String(err) }).catch(() => undefined);
-    }
-  };
-
-  // ── Agent loop from HUD (with tracking & save) ──
-
-  const runAgentLoopFromHudWithTracking = async () => {
-    loopStopRef.current = false;
-    hudIsSourceRef.current = true;
-    setLooping(true);
-    setBusy((b) => ({ ...b, run: true }));
-    const inst = hudInstruction || status.instruction || "Click the target button";
-
-    // Auto-save run as session if toggled on
-    if (saveRun) {
-      try {
-        await invoke("start_session_cmd", {
-          req: {
-            name: `Run: ${inst.slice(0, 40)}`,
-            instruction: inst,
-            task_context: hudContext.trim() || undefined,
-            model: hudModel,
-            fps: 2,
-          },
-        });
-        setRecActive(true);
-      } catch { /* best-effort */ }
-    }
-
-    let loopSuccess = false;
-    try {
-      const steps = await runAgentLoop({
-        instruction: inst,
-        model: hudModel,
-        shouldStop: () => loopStopRef.current,
-        onStep: pushActivity,
-      });
-
-      loopSuccess = steps.some((s) => s.phase === "done");
-
-      // Save collected activity
-      if (saveRun) {
-        try {
-          const manifest = await invoke<SessionManifest>("stop_session_cmd");
-          setRecActive(false);
-          if (loopSuccess) {
-            await invoke("save_activity_log_cmd", {
-              sessionId: manifest.session_id,
-              activityLog: steps,
-            }).catch(() => { /* best-effort */ });
-            void refreshSessions();
-          } else {
-            await invoke("delete_session_cmd", { sessionId: manifest.session_id }).catch(() => {});
-          }
-        } catch { /* best-effort */ }
-      }
-    } catch (err) {
-      await emit("hud_action_error", {
-        action: "agent_loop",
-        message: String(err),
-      }).catch(() => undefined);
-    } finally {
-      hudIsSourceRef.current = false;
-      setLooping(false);
-      setBusy((b) => ({ ...b, run: false }));
-    }
-  };
-
-  // ── Replay ──────────────────────────────────────
-
-  const replaySession = async () => {
-    if (!selectedSession) return;
-    replayStopRef.current = false;
-    hudIsSourceRef.current = true;
-    setReplaying(true);
-    const loops = infiniteRepeat ? Infinity : Math.max(1, repeatCount);
-    const inst = selectedSession.instruction || hudInstruction || "Repeat the recorded task";
-    const collectedSteps: AgentStep[] = [];
-
-    try {
-      for (let rep = 0; rep < loops; rep++) {
-        if (replayStopRef.current) break;
-        loopStopRef.current = false;
-        setLooping(true);
-        setBusy((b) => ({ ...b, run: true }));
-
-        const steps = await runAgentLoop({
-          instruction: inst,
-          model: hudModel,
-          shouldStop: () => loopStopRef.current || replayStopRef.current,
-          onStep: pushActivity,
-          delayMs: 800,
-        });
-        collectedSteps.push(...steps);
-
-        setLooping(false);
-        setBusy((b) => ({ ...b, run: false }));
-        if (rep + 1 < loops && !replayStopRef.current) {
-          await new Promise((r) => setTimeout(r, 1500));
+        // Fade out dropdown content
+        if (panelRef.current) {
+          tl.to(panelRef.current, {
+            opacity: 0, y: -6, duration: 0.15, ease: "power2.in",
+          }, 0);
         }
-      }
-    } finally {
-      if (selectedSession && collectedSteps.length > 0) {
-        invoke("save_activity_log_cmd", {
-          sessionId: selectedSession.session_id,
-          activityLog: collectedSteps,
-        }).catch(() => { /* best-effort */ });
-      }
-      hudIsSourceRef.current = false;
-      setReplaying(false);
-      setLooping(false);
-      setBusy((b) => ({ ...b, run: false }));
-    }
-  };
 
-  // ── Export activity to clipboard / .md ────────────
+        // Shrink window frame-by-frame via proxy
+        tl.to(proxy, {
+          h: BAR_H,
+          duration: 0.3,
+          ease: "power3.inOut",
+          onUpdate: () => {
+            void setWindowSizeCentered(HUD_WIDTH, Math.round(proxy.h));
+          },
+        }, 0);
 
-  const exportActivity = async () => {
-    const md = activityFeed
-      .map((a) => {
-        const ts = new Date(a.ts).toLocaleTimeString();
-        const prefix = a.step > 0 ? `[${a.step}/${a.max_steps}] ` : "";
-        return `- **${ts}** [${a.phase.toUpperCase()}] ${prefix}${a.message}`;
-      })
-      .join("\n");
-    const content = `# HUD Activity\n\n${md}\n`;
-    try {
-      const path = await invoke<string>("export_markdown_cmd", {
-        filename: "hud-activity.md",
-        content,
+        // Shrink pill visually in sync
+        if (pillRef.current) {
+          tl.to(pillRef.current, {
+            height: BAR_H, duration: 0.3, ease: "power3.inOut",
+          }, 0);
+        }
       });
-      // Also copy to clipboard as fallback
-      await navigator.clipboard.writeText(content).catch(() => undefined);
-      pushActivity({ phase: "done", step: 0, max_steps: 0, message: `Exported to ${path} (also copied to clipboard)` });
-    } catch (err) {
-      // Fallback: copy to clipboard only
-      try {
-        await navigator.clipboard.writeText(content);
-        pushActivity({ phase: "done", step: 0, max_steps: 0, message: "Copied activity to clipboard" });
-      } catch {
-        await emit("hud_action_error", { action: "export_activity", message: String(err) }).catch(() => undefined);
-      }
+
+      setShowActivity(false);
+      if (pillRef.current) pillRef.current.style.height = "";
+
+    } else {
+      // ── OPEN: animate height + content in sync ──
+      setShowActivity(true);
+      // Set pill to bar height so it starts small
+      if (pillRef.current) pillRef.current.style.height = `${BAR_H}px`;
+
+      const proxy = { h: BAR_H };
+      await new Promise<void>((resolve) => {
+        const tl = gsap.timeline({ onComplete: resolve });
+
+        // Grow window frame-by-frame via proxy
+        tl.to(proxy, {
+          h: EXPANDED_H,
+          duration: 0.3,
+          ease: "power2.out",
+          onUpdate: () => {
+            void setWindowSizeCentered(HUD_WIDTH, Math.round(proxy.h));
+          },
+        }, 0);
+
+        // Grow pill visually in sync
+        if (pillRef.current) {
+          tl.to(pillRef.current, {
+            height: "100%", duration: 0.3, ease: "power2.out",
+          }, 0);
+        }
+
+        // Fade in dropdown content (slightly delayed)
+        if (panelRef.current) {
+          tl.fromTo(panelRef.current,
+            { opacity: 0, y: -6 },
+            { opacity: 1, y: 0, duration: 0.2, ease: "power2.out" },
+            0.12,
+          );
+        }
+      });
     }
   };
 
-  // ── Overlay toggling ────────────────────────────
+  // ── Collapse / Expand with GSAP ────────────────
+  const collapseHud = async () => {
+    const win = getCurrentWindow();
+    const monitor = await currentMonitor();
+    const scale = monitor?.scaleFactor || 1;
+    const monX = monitor ? monitor.position.x / scale : 0;
+    const monW = monitor ? monitor.size.width / scale : 1400;
+    const monY = monitor ? monitor.position.y / scale : 0;
 
-  const toggleOverlayFromHud = async () => {
-    try {
-      if (status.overlay) {
-        const overlay = await WebviewWindow.getByLabel(OVERLAY_LABEL);
-        if (overlay) await overlay.hide().catch(() => undefined);
-        setStatus((s) => ({ ...s, overlay: false }));
-        await emit("hud_overlay_state_changed", { enabled: false }).catch(() => undefined);
-      } else {
-        await ensureOverlayWindow();
-        setStatus((s) => ({ ...s, overlay: true }));
-        await emit("hud_overlay_state_changed", { enabled: true }).catch(() => undefined);
-      }
-    } catch (err) {
-      await emit("hud_action_error", { action: "toggle_overlay", message: String(err) }).catch(() => undefined);
+    if (pillRef.current) {
+      await new Promise<void>((resolve) => {
+        gsap.to(pillRef.current, { scale: 0.5, opacity: 0, duration: 0.25, ease: "power3.in", onComplete: resolve });
+      });
     }
+
+    setHudCollapsed(true);
+    setShowActivity(false);
+
+    await win.setFocusable(false).catch(() => undefined);
+    const size = new LogicalSize(COLLAPSED_SIZE, COLLAPSED_SIZE);
+    await win.setMinSize(size).catch(() => undefined);
+    await win.setMaxSize(size).catch(() => undefined);
+    await win.setSize(size).catch(() => undefined);
+    await win.setPosition(new LogicalPosition(monX + monW / 2 - COLLAPSED_SIZE / 2, monY + 18)).catch(() => undefined);
+
+    requestAnimationFrame(() => {
+      if (pillRef.current) {
+        gsap.fromTo(pillRef.current, { scale: 0.3, opacity: 0 }, { scale: 1, opacity: 1, duration: 0.35, ease: "elastic.out(1, 0.5)" });
+      }
+    });
   };
 
-  // ── Main window toggling ────────────────────────
+  const expandHud = async () => {
+    if (pillRef.current) {
+      await new Promise<void>((resolve) => {
+        gsap.to(pillRef.current, { scale: 0.3, opacity: 0, duration: 0.2, ease: "power2.in", onComplete: resolve });
+      });
+    }
 
+    setHudCollapsed(false);
+    await setWindowSizeCentered(HUD_WIDTH, BAR_H);
+    const win = getCurrentWindow();
+    await win.setFocusable(true).catch(() => undefined);
+    await win.setIgnoreCursorEvents(false).catch(() => undefined);
+
+    requestAnimationFrame(() => {
+      if (pillRef.current) {
+        gsap.fromTo(pillRef.current, { scale: 0.8, opacity: 0, y: -10 }, { scale: 1, opacity: 1, y: 0, duration: 0.4, ease: "back.out(1.7)" });
+      }
+    });
+  };
+
+  const toggleCollapse = async () => {
+    if (hudCollapsed) await expandHud();
+    else await collapseHud();
+  };
+
+
+  // ── Main window toggle ─────────────────────────
   const openMainFromHud = async () => {
     const main = await WebviewWindow.getByLabel(MAIN_LABEL);
     if (!main) {
-      await emit("hud_action_error", { action: "open_main", message: "Main window not found (label=main)" }).catch(() => undefined);
+      await emit("hud_action_error", { action: "open_main", message: "Main window not found" }).catch(() => undefined);
       return;
     }
     const visible = await main.isVisible().catch(() => false);
@@ -443,398 +351,347 @@ export function HudWindow() {
     }
   };
 
-  const suppressDashboard = () => {
-    void (async () => {
-      const main = await WebviewWindow.getByLabel(MAIN_LABEL);
-      if (main) await main.hide().catch(() => undefined);
-    })();
+  // ── Agent loop from HUD ────────────────────────
+  const runAgentLoopFromHud = async () => {
+    if (!hudInstruction.trim()) return;
+    loopStopRef.current = false;
+    pausedRef.current = false;
+    setPaused(false);
+    hudIsSourceRef.current = true;
+    instructionRef.current = hudInstruction;
+    setLooping(true);
+    loopingRef.current = true;
+    setShowActivity(true);
+    setRedirectInput("");
+
+    // Expand to show activity
+    await setWindowSizeCentered(HUD_WIDTH, EXPANDED_H);
+
+    lastRunStepsRef.current = [];
+    setHasUnsavedRun(false);
+    try {
+      const steps = await runAgentLoop({
+        instruction: hudInstruction,
+        model: hudModel,
+        shouldStop: () => loopStopRef.current,
+        shouldPause: () => pausedRef.current,
+        getInstruction: () => instructionRef.current,
+        onStep: pushActivity,
+        onVision: (v) => {
+          if (v.action !== "none") lastRunStepsRef.current.push(v);
+        },
+      });
+      const costSummary = summarizeRunCost(steps);
+      if (costSummary) {
+        pushActivity({ phase: "done", step: 0, max_steps: 0, message: `Run complete — ${costSummary}` });
+      }
+      setHasUnsavedRun(lastRunStepsRef.current.length > 0);
+    } catch (err) {
+      await emit("hud_action_error", { action: "agent_loop", message: String(err) }).catch(() => undefined);
+    } finally {
+      hudIsSourceRef.current = false;
+      setLooping(false);
+      loopingRef.current = false;
+      setPaused(false);
+      pausedRef.current = false;
+    }
   };
 
-  // ── Collapse / Expand ────────────────────────────
+  const togglePause = () => {
+    const next = !pausedRef.current;
+    pausedRef.current = next;
+    setPaused(next);
+  };
 
-  const collapseHud = async () => {
+  const sendRedirect = () => {
+    const msg = redirectInput.trim();
+    if (!msg) return;
+    // Append redirect context to the instruction
+    instructionRef.current = `${instructionRef.current}\n\nUser redirect: ${msg}`;
+    pushActivity({ phase: "capture" as AgentStep["phase"], step: 0, max_steps: 0, message: `Redirected: ${msg}` });
+    setRedirectInput("");
+    // If agent is paused, resume it
+    if (pausedRef.current) {
+      pausedRef.current = false;
+      setPaused(false);
+    }
+    // If agent loop has finished, restart it with the updated instruction
+    if (!loopingRef.current) {
+      void runAgentLoopFromHud();
+    }
+  };
+
+  const saveLastRun = async () => {
+    const steps = lastRunStepsRef.current;
+    if (steps.length === 0) return;
+    try {
+      const totalCost = steps.reduce((sum, v) => sum + (v.usage.estimated_cost_usd ?? 0), 0);
+      const savedRunSteps = steps.map((v) => ({
+        action: v.action,
+        x_norm: v.x_norm,
+        y_norm: v.y_norm,
+        confidence: v.confidence,
+        reason: v.reason,
+        sent_w: v.sent_w,
+        sent_h: v.sent_h,
+        keys: v.keys ?? null,
+        text: v.text ?? null,
+        command: v.command ?? null,
+        tool_name: v.tool_name ?? null,
+        shortcut: v.shortcut ?? null,
+      }));
+      const run = await invoke<SavedRun>("save_run_cmd", {
+        req: {
+          instruction: instructionRef.current || hudInstruction,
+          task_context: null,
+          model: hudModel,
+          steps: savedRunSteps,
+          total_cost_usd: totalCost,
+        },
+      });
+      pushActivity({ phase: "done", step: 0, max_steps: 0, message: `Run saved (${run.total_steps} steps)` });
+      lastRunStepsRef.current = [];
+      setHasUnsavedRun(false);
+    } catch (err) {
+      pushActivity({ phase: "error" as AgentStep["phase"], step: 0, max_steps: 0, message: `Save error: ${String(err)}` });
+    }
+  };
+
+  // ── Export activity ────────────────────────────
+  const exportActivity = async () => {
+    const md = activityFeed
+      .map((a) => {
+        const ts = new Date(a.ts).toLocaleTimeString();
+        const prefix = a.step > 0 ? `[${a.step}/${a.max_steps}] ` : "";
+        return `- **${ts}** [${a.phase.toUpperCase()}] ${prefix}${a.message}`;
+      })
+      .join("\n");
+    const content = `# HUD Activity\n\n${md}\n`;
+    try {
+      const path = await invoke<string>("export_markdown_cmd", { filename: "hud-activity.md", content });
+      await navigator.clipboard.writeText(content).catch(() => undefined);
+      pushActivity({ phase: "done", step: 0, max_steps: 0, message: `Exported → ${path}` });
+    } catch {
+      try {
+        await navigator.clipboard.writeText(content);
+        pushActivity({ phase: "done", step: 0, max_steps: 0, message: "Copied to clipboard" });
+      } catch (err) {
+        await emit("hud_action_error", { action: "export_activity", message: String(err) }).catch(() => undefined);
+      }
+    }
+  };
+
+  const copyActivity = () => {
+    const text = activityFeed
+      .map((a) => {
+        const ts = new Date(a.ts).toLocaleTimeString();
+        const prefix = a.step > 0 ? `[${a.step}/${a.max_steps}] ` : "";
+        return `${ts} [${a.phase.toUpperCase()}] ${prefix}${a.message}`;
+      })
+      .join("\n");
+    void navigator.clipboard.writeText(text).then(() => {
+      pushActivity({ phase: "done", step: 0, max_steps: 0, message: "Copied to clipboard" });
+    });
+  };
+
+  // ── Focus input ────────────────────────────────
+  const focusInput = () => {
     const win = getCurrentWindow();
-    const monitor = await currentMonitor();
-    const scale = monitor?.scaleFactor || 1;
-    const monX = monitor ? monitor.position.x / scale : 0;
-    const monW = monitor ? monitor.size.width / scale : 1400;
-    const monY = monitor ? monitor.position.y / scale : 0;
-    setHudCollapsed(true);
-    setHudPanel("none");
-    const w = 48, h = 48;
-    await win.setFocusable(false).catch(() => undefined);
-    await win.setMinSize(new LogicalSize(w, h)).catch(() => undefined);
-    await win.setMaxSize(new LogicalSize(w, h)).catch(() => undefined);
-    await win.setSize(new LogicalSize(w, h)).catch(() => undefined);
-    await win.setPosition(new LogicalPosition(monX + monW / 2 - w / 2, monY + 20)).catch(() => undefined);
+    void win.setFocus().catch(() => undefined);
+    setTimeout(() => inputRef.current?.focus(), 50);
   };
 
-  const expandHud = async () => {
-    const win = getCurrentWindow();
-    const monitor = await currentMonitor();
-    const scale = monitor?.scaleFactor || 1;
-    const monX = monitor ? monitor.position.x / scale : 0;
-    const monW = monitor ? monitor.size.width / scale : 1400;
-    const monY = monitor ? monitor.position.y / scale : 0;
-    setHudCollapsed(false);
-    await win.setMinSize(new LogicalSize(HUD_WIDTH, HUD_HEIGHT)).catch(() => undefined);
-    await win.setMaxSize(new LogicalSize(HUD_WIDTH, HUD_HEIGHT)).catch(() => undefined);
-    await win.setSize(new LogicalSize(HUD_WIDTH, HUD_HEIGHT)).catch(() => undefined);
-    await win.setPosition(new LogicalPosition(monX + monW / 2 - HUD_WIDTH / 2, monY + 20)).catch(() => undefined);
+  // ── Drag support (grip handle only) ─────────────
+  const startDrag = (e: React.MouseEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    void getCurrentWindow().startDragging();
   };
 
-  const toggleCollapse = async () => {
-    if (hudCollapsed) await expandHud();
-    else await collapseHud();
+  // ── Reset position (double-click drag area) ────
+  const resetPosition = () => {
+    if (hudCollapsed) {
+      void setWindowSizeCentered(COLLAPSED_SIZE, COLLAPSED_SIZE);
+    } else if (showActivity) {
+      void setWindowSizeCentered(HUD_WIDTH, EXPANDED_H);
+    } else {
+      void setWindowSizeCentered(HUD_WIDTH, BAR_H);
+    }
   };
 
-  // ── Render ──────────────────────────────────────
+  // ── Render ─────────────────────────────────────
 
   return (
-    <main
-      className={`hud-root ${hudPanel !== "none" ? "hud-expanded" : ""} ${hudCollapsed ? "hud-collapsed" : ""}`}
-      onClick={suppressDashboard}
-    >
-      <section
-        className={`hud-pill ${hudPanel !== "none" ? "expanded" : ""} ${hudCollapsed ? "collapsed" : ""}`}
-        onMouseDown={(e) => { if (hudPanel !== "command" && hudPanel !== "record") e.preventDefault(); }}
-        title={hudCollapsed ? "Click to expand" : "Computer Use HUD"}
+    <main className={`hud-root ${hudCollapsed ? "hud-collapsed" : ""}`}>
+      <div
+        ref={pillRef}
+        className={`hud-pill ${showActivity ? "expanded" : ""} ${hudCollapsed ? "collapsed" : ""} ${windowBlurred ? "hud-blurred" : ""}`}
+        title={hudCollapsed ? "Click to expand" : ""}
       >
         {hudCollapsed ? (
           <button
-            className="hud-btn hud-btn-icon"
+            className="hud-btn hud-btn-collapsed"
             onClick={() => void toggleCollapse()}
             title="Expand HUD"
             type="button"
           >
             <svg viewBox="0 0 24 24" className="hud-icon" aria-hidden="true">
-              <path d="M9 18l6-6-6-6" />
+              <path d="M12 5v14" />
+              <path d="M5 12h14" />
             </svg>
           </button>
         ) : (
           <>
-        <div className="hud-main">
-          <div className="hud-controls">
-            <button
-              className="hud-btn hud-btn-icon"
-              onClick={(e) => { e.stopPropagation(); void openMainFromHud(); }}
-              title="Show main menu"
-              aria-label="Show main menu"
-              type="button"
-            >
-              <svg viewBox="0 0 24 24" className="hud-icon" aria-hidden="true">
-                <path d="M5 7h14" />
-                <path d="M5 12h14" />
-                <path d="M5 17h14" />
-              </svg>
-            </button>
-            <button
-              className={`hud-btn hud-btn-icon ${hudPanel === "record" ? "active" : ""} ${recActive ? "recording-pulse" : ""}`}
-              onClick={(e) => { e.stopPropagation(); void togglePanel("record"); }}
-              title="Session recording & replay"
-              aria-label="Session recording & replay"
-              type="button"
-            >
-              <svg viewBox="0 0 24 24" className="hud-icon" aria-hidden="true">
-                <circle cx="12" cy="12" r="8" />
-                <circle cx="12" cy="12" r="3.5" fill="currentColor" stroke="none" />
-              </svg>
-            </button>
-            <button
-              className={`hud-btn hud-btn-icon ${hudPanel === "command" ? "active" : ""}`}
-              onClick={(e) => { e.stopPropagation(); void togglePanel("command"); }}
-              title="Set instruction & run agent loop"
-              aria-label="Set instruction & run agent loop"
-              type="button"
-            >
-              <svg viewBox="0 0 24 24" className="hud-icon" aria-hidden="true">
-                <path d="M12 20h9" />
-                <path d="M16.5 3.5a2.121 2.121 0 1 1 3 3L7 19l-4 1 1-4Z" />
-              </svg>
-            </button>
-            <button
-              className={`hud-btn hud-btn-icon ${hudPanel === "activity" ? "active" : ""}`}
-              onClick={(e) => { e.stopPropagation(); void togglePanel("activity"); }}
-              title="Toggle model activity feed"
-              aria-label="Toggle model activity feed"
-              type="button"
-            >
-              <svg viewBox="0 0 24 24" className="hud-icon" aria-hidden="true">
-                <path d="M6 9l6 6 6-6" />
-              </svg>
-            </button>
-            <button
-              className={`hud-btn hud-btn-icon ${status.overlay ? "" : "overlay-off"}`}
-              onClick={(e) => { e.stopPropagation(); void toggleOverlayFromHud(); }}
-              title="Toggle visual overlay cursor layer"
-              aria-label="Toggle visual overlay cursor layer"
-              type="button"
-            >
-              <svg viewBox="0 0 24 24" className="hud-icon" aria-hidden="true">
-                <circle cx="12" cy="12" r="9" />
-                <circle cx="12" cy="12" r="4.5" />
-                <circle cx="12" cy="12" r="1.2" fill="currentColor" stroke="none" />
-                <path d="M12 2v4" />
-                <path d="M12 18v4" />
-                <path d="M2 12h4" />
-                <path d="M18 12h4" />
-              </svg>
-            </button>
-          </div>
-          <div className="hud-right">
-            {looping && (
-              <button
-                className="hud-btn"
-                onClick={(e) => { e.stopPropagation(); loopStopRef.current = true; }}
-                title="Stop agent loop"
-                style={{ fontSize: "0.5rem", padding: "2px 5px" }}
-              >
-                STOP
-              </button>
-            )}
-            <ElapsedTimer active={looping} label="▶" />
-            <ElapsedTimer active={recActive} label="●" />
-            <span
-              className={`hud-state ${recordingActive ? "ok" : "bad"}`}
-              title={recordingActive ? `Recording (${recordingTicks} ticks)` : "Recording idle"}
-            >
-              {recordingActive ? "REC" : "IDLE"}
-            </span>
-            <span
-              className={`hud-state ${status.permsReady && status.keyLoaded ? "ok" : "bad"}`}
-              title={status.permsReady && status.keyLoaded ? "Ready" : "Setup needed"}
-            >
-              {status.permsReady && status.keyLoaded ? "READY" : "SETUP"}
-            </span>
-
-            <button
-              className="hud-btn hud-btn-icon"
-              onClick={(e) => { e.stopPropagation(); void toggleCollapse(); }}
-              title="Collapse HUD"
-              type="button"
-            >
-              <svg viewBox="0 0 24 24" className="hud-icon" aria-hidden="true">
-                <path d="M15 18l-6-6 6-6" />
-              </svg>
-            </button>
-          </div>
-        </div>
-
-        {hudPanel === "activity" && (
-          <div className="hud-dropdown">
-            <div style={{ display: "flex", justifyContent: "flex-end", gap: "4px", padding: "0 2px 2px" }}>
-              <button
-                className="hud-btn"
-                onClick={(e) => { e.stopPropagation(); void exportActivity(); }}
-                style={{ fontSize: "0.46rem", padding: "2px 6px" }}
-                title="Export activity as .md and copy to clipboard"
-              >
-                Export .md
-              </button>
-              <button
-                className="hud-btn"
-                onClick={(e) => {
-                  e.stopPropagation();
-                  const text = activityFeed
-                    .map((a) => {
-                      const ts = new Date(a.ts).toLocaleTimeString();
-                      const prefix = a.step > 0 ? `[${a.step}/${a.max_steps}] ` : "";
-                      return `${ts} [${a.phase.toUpperCase()}] ${prefix}${a.message}`;
-                    })
-                    .join("\n");
-                  void navigator.clipboard.writeText(text).then(() => {
-                    pushActivity({ phase: "done", step: 0, max_steps: 0, message: "Copied to clipboard" });
-                  });
-                }}
-                style={{ fontSize: "0.46rem", padding: "2px 6px" }}
-                title="Copy activity text to clipboard"
-              >
-                Copy
-              </button>
-              {activityFeed.length > 0 && (
-                <button
-                  className="hud-btn"
-                  onClick={(e) => { e.stopPropagation(); setActivityFeed([]); }}
-                  style={{ fontSize: "0.46rem", padding: "2px 6px" }}
-                  title="Clear activity feed"
-                >
-                  Clear
+            {/* ── Inline Chat Bar ─── */}
+            <div className="hud-main">
+              <div className="hud-controls">
+                <button className="hud-btn hud-btn-icon" onClick={() => void openMainFromHud()} title="Dashboard" type="button">
+                  <svg viewBox="0 0 24 24" className="hud-icon"><path d="M5 7h14" /><path d="M5 12h14" /><path d="M5 17h14" /></svg>
                 </button>
-              )}
-            </div>
-            <ActivityFeed items={activityFeed} endRef={activityEndRef} />
-          </div>
-        )}
-
-        {hudPanel === "command" && (
-          <div className="hud-input-panel">
-            <input
-              placeholder="Instruction (e.g. Open Chrome and go to google.com)"
-              value={hudInstruction}
-              onChange={(e) => setHudInstruction(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === "Enter" && !e.shiftKey) {
-                  e.preventDefault();
-                  void runAgentLoopFromHudWithTracking();
-                }
-              }}
-            />
-            <textarea
-              placeholder="Task context (optional)"
-              rows={2}
-              value={hudContext}
-              onChange={(e) => setHudContext(e.target.value)}
-            />
-            <div style={{ display: "flex", alignItems: "center", gap: "6px" }}>
-              <select
-                value={hudModel}
-                onChange={(e) => updateHudModel(e.target.value)}
-                style={{ fontSize: "0.48rem", fontWeight: 400, padding: "1px 14px 1px 4px", height: "16px", minHeight: 0, background: "rgba(15,23,42,0.5)", color: "rgba(226,232,240,0.6)", border: "1px solid rgba(170,214,255,0.1)", borderRadius: "4px", flex: 1, backgroundImage: "url(\"data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='8' height='8' viewBox='0 0 12 12'%3E%3Cpath fill='%2364748b' d='M2 4l4 4 4-4'/%3E%3C/svg%3E\")", backgroundRepeat: "no-repeat", backgroundPosition: "right 4px center" }}
-              >
-                {MODEL_OPTIONS.map((m) => (
-                  <option key={m.id} value={m.id}>{m.label}</option>
-                ))}
-              </select>
-            </div>
-            <div className="hud-input-actions">
-              <button
-                className="hud-btn"
-                disabled={busy.run || !hudInstruction.trim()}
-                onClick={() => void runAgentLoopFromHudWithTracking()}
-              >
-                {looping ? "Running..." : "▶ Run Loop"}
-              </button>
-              <label style={{ display: "flex", alignItems: "center", gap: "4px", fontSize: "0.5rem", color: "rgba(226,232,240,0.7)", cursor: "pointer" }}>
-                <input
-                  type="checkbox"
-                  checked={saveRun}
-                  onChange={(e) => setSaveRun(e.target.checked)}
-                  style={{ width: "12px", height: "12px", accentColor: "var(--accent)" }}
-                />
-                Save run
-              </label>
-            </div>
-          </div>
-        )}
-
-        {hudPanel === "record" && (
-          <div className="hud-input-panel">
-            {recActive ? (
-              <>
-                <div style={{ display: "flex", alignItems: "center", gap: "6px" }}>
-                  <span className="hud-state recording-pulse" style={{ background: "rgba(255,60,60,0.25)", borderColor: "rgba(255,60,60,0.7)", color: "#ff8080" }}>● REC</span>
-                  <span style={{ fontSize: "0.55rem", color: "rgba(226,232,240,0.7)" }}>{formatDuration(recElapsed)}</span>
-                </div>
-                <div className="hud-input-actions">
-                  <button className="hud-btn overlay-off" onClick={() => void stopSession()}>■ Stop</button>
-                </div>
-              </>
-            ) : (
-              <>
-                <input
-                  placeholder="Session name (auto-generated if empty)"
-                  value={recSessionName}
-                  onChange={(e) => setRecSessionName(e.target.value)}
-                />
-                <input
-                  placeholder="What should this do?"
-                  value={recInstruction}
-                  onChange={(e) => setRecInstruction(e.target.value)}
-                />
-                <div style={{ display: "flex", alignItems: "center", gap: "6px" }}>
-                  <select
-                    value={hudModel}
-                    onChange={(e) => updateHudModel(e.target.value)}
-                    style={{ fontSize: "0.48rem", fontWeight: 400, padding: "1px 14px 1px 4px", height: "16px", minHeight: 0, background: "rgba(15,23,42,0.5)", color: "rgba(226,232,240,0.6)", border: "1px solid rgba(170,214,255,0.1)", borderRadius: "4px", flex: 1, backgroundImage: "url(\"data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='8' height='8' viewBox='0 0 12 12'%3E%3Cpath fill='%2364748b' d='M2 4l4 4 4-4'/%3E%3C/svg%3E\")", backgroundRepeat: "no-repeat", backgroundPosition: "right 4px center" }}
-                  >
-                    {MODEL_OPTIONS.map((m) => (
-                      <option key={m.id} value={m.id}>{m.label}</option>
-                    ))}
-                  </select>
-                </div>
-                <div className="hud-input-actions">
-                  <button className="hud-btn" onClick={() => void startSession()}>● Record</button>
-                </div>
-                {savedSessions.length > 0 && (
-                  <>
-                    <div style={{ borderTop: "1px solid rgba(170,214,255,0.12)", paddingTop: "4px", marginTop: "2px" }}>
-                      <div style={{ fontSize: "0.52rem", color: "rgba(148,163,184,0.6)", marginBottom: "3px" }}>Saved Sessions</div>
-                      <div style={{ maxHeight: "60px", overflowY: "auto", display: "flex", flexDirection: "column", gap: "2px" }}>
-                        {savedSessions.map((s) => (
-                          <button
-                            key={s.session_id}
-                            className={`hud-btn ${selectedSession?.session_id === s.session_id ? "active" : ""}`}
-                            style={{ fontSize: "0.5rem", textAlign: "left", padding: "3px 6px" }}
-                            onClick={() => {
-                              if (selectedSession?.session_id === s.session_id) {
-                                setSelectedSession(null);
-                              } else {
-                                setSelectedSession(s);
-                                if (s.model) setHudModel(s.model);
-                              }
-                            }}
-                          >
-                            {s.name} — {formatDuration(Number(s.duration_ms))}
-                          </button>
-                        ))}
-                      </div>
-                    </div>
-                    {selectedSession && (
-                      <div style={{ display: "flex", alignItems: "center", gap: "4px", marginTop: "2px", flexWrap: "wrap" }}>
-                        <button
-                          className="hud-btn"
-                          disabled={replaying || busy.run}
-                          onClick={() => void replaySession()}
-                          style={{ fontSize: "0.52rem" }}
-                        >
-                            {replaying ? "Replaying..." : "▶ Replay"}
-                        </button>
-                        {replaying && (
-                          <button
-                            className="hud-btn overlay-off"
-                            onClick={() => { replayStopRef.current = true; loopStopRef.current = true; }}
-                            style={{ fontSize: "0.52rem" }}
-                          >
-                            ■ Stop
-                          </button>
-                        )}
-                        <select
-                          value={hudModel}
-                          onChange={(e) => updateHudModel(e.target.value)}
-                          style={{ fontSize: "0.46rem", padding: "2px 3px", background: "rgba(15,23,42,0.7)", color: "rgba(226,232,240,0.9)", border: "1px solid rgba(170,214,255,0.15)", borderRadius: "3px", maxWidth: "100px" }}
-                        >
-                          {MODEL_OPTIONS.map((m) => (
-                            <option key={m.id} value={m.id}>{m.label}</option>
-                          ))}
-                        </select>
-                        <span style={{ fontSize: "0.48rem", color: "rgba(226,232,240,0.6)" }}>×</span>
-                        {infiniteRepeat ? (
-                          <button className="hud-btn active" onClick={() => setInfiniteRepeat(false)} style={{ fontSize: "0.52rem", padding: "2px 5px" }}>∞</button>
-                        ) : (
-                          <>
-                            <input
-                              type="number"
-                              min={1}
-                              max={999}
-                              value={repeatCount}
-                              onChange={(e) => setRepeatCount(Math.max(1, Number(e.target.value) || 1))}
-                              style={{ width: "32px", fontSize: "0.52rem", padding: "2px 4px", textAlign: "center" }}
-                            />
-                            <button className="hud-btn" onClick={() => setInfiniteRepeat(true)} style={{ fontSize: "0.48rem", padding: "2px 4px" }}>∞</button>
-                          </>
-                        )}
-                      </div>
+                {looping ? (
+                  <button className={`hud-btn hud-btn-icon ${paused ? "active" : ""}`} onClick={togglePause} title={paused ? "Resume" : "Pause"} type="button">
+                    {paused ? (
+                      <svg viewBox="0 0 24 24" className="hud-icon"><polygon points="8,5 19,12 8,19" fill="currentColor" stroke="none" /></svg>
+                    ) : (
+                      <svg viewBox="0 0 24 24" className="hud-icon"><rect x="6" y="5" width="4" height="14" fill="currentColor" rx="1" /><rect x="14" y="5" width="4" height="14" fill="currentColor" rx="1" /></svg>
                     )}
-                  </>
+                  </button>
+                ) : (
+                  <button
+                    className="hud-btn hud-btn-icon"
+                    disabled={!hudInstruction.trim()}
+                    onClick={() => void runAgentLoopFromHud()}
+                    title="Run agent"
+                    type="button"
+                  >
+                    <svg viewBox="0 0 24 24" className="hud-icon"><polygon points="8,5 19,12 8,19" fill="currentColor" stroke="none" /></svg>
+                  </button>
                 )}
-              </>
-            )}
-          </div>
-        )}
+              </div>
 
-        </>
+              {looping ? (
+                <div className="hud-task-summary" title={hudInstruction}>
+                  {paused ? "⏸ " : ""}{hudInstruction.length > 50 ? `${hudInstruction.slice(0, 50)}…` : hudInstruction}
+                </div>
+              ) : (
+                <input
+                  ref={inputRef}
+                  className="hud-chat-input"
+                  placeholder="Type instruction…"
+                  value={hudInstruction}
+                  onClick={focusInput}
+                  onChange={(e) => setHudInstruction(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter" && !e.shiftKey && !looping) {
+                      e.preventDefault();
+                      void runAgentLoopFromHud();
+                    }
+                  }}
+                  autoComplete="off"
+                  spellCheck={false}
+                />
+              )}
+
+              <div className="hud-right">
+                {looping && <ElapsedTimer active={looping} />}
+                <button className={`hud-btn hud-btn-icon ${showActivity ? "active" : ""}`} onClick={() => void toggleActivity()} title="Activity" type="button">
+                  <svg viewBox="0 0 24 24" className="hud-icon"><path d="M6 9l6 6 6-6" /></svg>
+                </button>
+                <button className="hud-btn hud-btn-icon" onClick={() => void toggleCollapse()} title="Collapse" type="button">
+                  <svg viewBox="0 0 24 24" className="hud-icon"><path d="M18 6L6 18" /><path d="M6 6l12 12" /></svg>
+                </button>
+                {/* ── Drag grip (6 dots) ─── */}
+                <div
+                  className="hud-grip"
+                  data-tauri-drag-region
+                  onMouseDown={startDrag}
+                  onDoubleClick={resetPosition}
+                  title="Drag to move • Double-click to reset"
+                >
+                  <svg viewBox="0 0 8 14" width="8" height="14">
+                    <circle cx="2" cy="2" r="1.1" fill="currentColor" />
+                    <circle cx="6" cy="2" r="1.1" fill="currentColor" />
+                    <circle cx="2" cy="7" r="1.1" fill="currentColor" />
+                    <circle cx="6" cy="7" r="1.1" fill="currentColor" />
+                    <circle cx="2" cy="12" r="1.1" fill="currentColor" />
+                    <circle cx="6" cy="12" r="1.1" fill="currentColor" />
+                  </svg>
+                </div>
+              </div>
+            </div>
+
+            {/* ── Activity Panel ─── */}
+            {showActivity && (
+              <div className="hud-dropdown" ref={panelRef}>
+                <div className="hud-panel-toolbar">
+                  <select value={hudModel} onChange={(e) => updateHudModel(e.target.value)} className="hud-model-select">
+                    {MODEL_OPTIONS.map((m) => (<option key={m.id} value={m.id}>{m.label}</option>))}
+                  </select>
+                  <button className="hud-btn hud-btn-sm" onClick={() => void exportActivity()} title="Export .md">Export</button>
+                  <button className="hud-btn hud-btn-sm" onClick={() => copyActivity()} title="Copy">Copy</button>
+                  {activityFeed.length > 0 && (
+                    <button className="hud-btn hud-btn-sm" onClick={() => setActivityFeed([])} title="Clear">Clear</button>
+                  )}
+                </div>
+                <ActivityFeed items={activityFeed} endRef={activityEndRef} />
+                {/* ── Redirect bar (pinned to bottom of dropdown) ─── */}
+                <div className="hud-redirect-bar">
+                  <div className="hud-redirect-input-wrap">
+                    <input
+                      ref={redirectInputRef}
+                      className="hud-redirect-input"
+                      placeholder={looping ? "Redirect agent…" : "Type instruction…"}
+                      value={redirectInput}
+                      onChange={(e) => setRedirectInput(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter" && !e.shiftKey) {
+                          e.preventDefault();
+                          sendRedirect();
+                        }
+                      }}
+                      autoComplete="off"
+                      spellCheck={false}
+                    />
+                    <button
+                      className="hud-redirect-send"
+                      disabled={!redirectInput.trim()}
+                      onClick={sendRedirect}
+                      title="Send"
+                      type="button"
+                    >
+                      <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                        <line x1="22" y1="2" x2="11" y2="13" />
+                        <polygon points="22 2 15 22 11 13 2 9 22 2" />
+                      </svg>
+                    </button>
+                  </div>
+                  {looping && (
+                    <button
+                      className="hud-btn hud-btn-sm hud-btn-stop-sm"
+                      onClick={() => { loopStopRef.current = true; }}
+                      title="Stop run"
+                      type="button"
+                    >
+                      ■
+                    </button>
+                  )}
+                  {hasUnsavedRun && !looping && (
+                    <button
+                      className="hud-btn hud-btn-sm"
+                      onClick={() => void saveLastRun()}
+                      title="Save this run"
+                      type="button"
+                      style={{ borderColor: "rgba(90, 176, 255, 0.4)", color: "#8ed6ff" }}
+                    >
+                      Save
+                    </button>
+                  )}
+                </div>
+              </div>
+            )}
+          </>
         )}
-      </section>
+      </div>
     </main>
   );
 }

@@ -14,6 +14,7 @@ import type {
   MistralAuthStatus,
   PermissionState,
   RuntimeState,
+  SavedRun,
   SessionManifest,
   SessionStatus,
   Tab,
@@ -36,11 +37,14 @@ import {
   executeInferredAction,
   formatVisionCost,
   formatVisionUsage,
+  replayRun,
   runAgentLoop,
   summarizeRunCost,
 } from "../lib/agentRunner";
 import { RunTab } from "./RunTab";
-import { SessionsTab } from "./SessionsTab";
+import { SavedRunsTab } from "./SavedRunsTab";
+import { ShortcutsTab } from "./ShortcutsTab";
+import { MemoryTab } from "./MemoryTab";
 import { DevTab } from "./DevTab";
 import { ModelActivityPanel, type ModelActivityPanelHandle } from "./ModelActivityPanel";
 import { ActivityLogPanel } from "./ActivityLogPanel";
@@ -59,11 +63,20 @@ export function MainApp() {
   const [runtime, setRuntime] = useState<RuntimeState | null>(null);
   const [capture, setCapture] = useState<CaptureFrame | null>(null);
   const [vision, setVision] = useState<VisionAction | null>(null);
-  const [instruction, setInstruction] = useState("Click the Save button");
+  const [instruction, setInstruction] = useState("Open Google Chrome, search for 'weather in San Francisco', and take a screenshot of the results");
   const [taskContext, setTaskContext] = useState(
-    "Goal: complete the task using all available actions — clicking, typing text, keyboard shortcuts (hotkeys), and shell commands.\nAfter using Cmd+Space to open Spotlight, always TYPE the app name, then press Return.\nUse Cmd+Tab to switch apps if the target app is not visible.\nReturn action=none only when the goal is fully achieved.",
+    "Goal: complete the task using all available actions — clicking, typing text, keyboard shortcuts (hotkeys), and shell commands.\nAfter using Cmd+Space to open Spotlight, always TYPE the app name, then press Return.\nReturn action=none only when the goal is fully achieved.",
   );
-  const [model, setModel] = useState(DEFAULT_HUD_MODEL);
+  const [model, setModel] = useState(() => {
+    const stored = localStorage.getItem("computer-use-default-model");
+    const validIds = MODEL_OPTIONS.map((m) => m.id) as readonly string[];
+    if (!stored || !validIds.includes(stored)) {
+      localStorage.setItem("computer-use-default-model", DEFAULT_HUD_MODEL);
+      return DEFAULT_HUD_MODEL;
+    }
+    return stored;
+  });
+  const [maxSteps, setMaxSteps] = useState(30);
 
   const updateModel = (m: string) => {
     setModel(m);
@@ -76,20 +89,13 @@ export function MainApp() {
   const [selectedSessionId, setSelectedSessionId] = useState<string | null>(null);
   const [recordingsRoot, setRecordingsRoot] = useState("");
 
-  // Auto-fill from selected session
-  useEffect(() => {
-    if (selectedSessionId) {
-      const session = sessions.find((s) => s.session_id === selectedSessionId);
-      if (session?.instruction) setInstruction(session.instruction);
-      if (session?.task_context) setTaskContext(session.task_context);
-      if (session?.model) setModel(session.model);
-      invoke<AgentStep[]>("load_activity_log_cmd", { sessionId: selectedSessionId })
-        .then((log) => { if (log?.length > 0) setModelActivity(log); })
-        .catch(() => { /* old sessions may not have activity logs */ });
-    } else {
-      setModelActivity([]);
-    }
-  }, [selectedSessionId, sessions]);
+  // ── Saved Runs State ──────────────────────────────
+  const [savedRuns, setSavedRuns] = useState<SavedRun[]>([]);
+  const [selectedRunId, setSelectedRunId] = useState<string | null>(null);
+  const lastRunStepsRef = useRef<VisionAction[]>([]);
+  const lastRunInstructionRef = useRef("");
+  const lastRunScreenshotsRef = useRef<string[]>([]);
+  const [hasUnsavedRun, setHasUnsavedRun] = useState(false);
 
   const [log, setLog] = useState<string[]>([]);
   const [modelActivity, setModelActivity] = useState<AgentStep[]>([]);
@@ -240,7 +246,7 @@ export function MainApp() {
       refreshRuntime(true),
       refreshRecordingStatus(true),
       loadRecordingsRoot(true),
-      loadSessions(true),
+      loadSavedRuns(true),
     ]);
     if (overlayEnabled) {
       const ok = await ensureOverlayWindow()
@@ -446,16 +452,27 @@ export function MainApp() {
       const steps = await runAgentLoop({
         instruction: effectiveInstruction,
         model,
+        maxSteps,
         shouldStop: () => loopStopRef.current,
         onStep: (step) => {
           pushModelActivity(step);
           if (step.phase === "error") pushLog(`agent loop error: ${step.message}`);
         },
-        onCapture: setCapture,
-        onVision: setVision,
+        onCapture: (c) => {
+          setCapture(c);
+          lastRunScreenshotsRef.current.push(c.png_path);
+        },
+        onVision: (v) => {
+          setVision(v);
+          // Collect actions for Save Run
+          if (v.action !== "none") lastRunStepsRef.current.push(v);
+        },
       });
+      lastRunInstructionRef.current = effectiveInstruction;
+      setHasUnsavedRun(lastRunStepsRef.current.length > 0);
       const totalCost = summarizeRunCost(steps);
       pushLog(totalCost ? `agent loop complete (${totalCost})` : "agent loop complete");
+      pushLog('Click "Save Run" in the Run tab to save this run for replay.');
       await refreshRuntime(true);
     } catch (err) {
       pushLog(`agent loop error: ${String(err)}`);
@@ -507,121 +524,256 @@ export function MainApp() {
     }
   };
 
+  // ── Saved Runs Functions ─────────────────────────
+
+  const loadSavedRuns = async (silent = false) => {
+    try {
+      const runs = await invoke<SavedRun[]>("list_saved_runs_cmd");
+      setSavedRuns(runs);
+      if (!silent) pushLog(`saved runs loaded → ${runs.length} run(s)`);
+    } catch (err) { if (!silent) pushLog(`saved runs load error: ${String(err)}`); }
+  };
+
+  const saveLastRun = async () => {
+    const steps = lastRunStepsRef.current;
+    if (steps.length === 0) { pushLog("nothing to save: run the agent loop first"); return; }
+    try {
+      const totalCost = steps.reduce((sum, v) => sum + (v.usage.estimated_cost_usd ?? 0), 0);
+      const savedRunSteps = steps.map((v) => ({
+        action: v.action,
+        x_norm: v.x_norm,
+        y_norm: v.y_norm,
+        confidence: v.confidence,
+        reason: v.reason,
+        sent_w: v.sent_w,
+        sent_h: v.sent_h,
+        keys: v.keys ?? null,
+        text: v.text ?? null,
+        command: v.command ?? null,
+        tool_name: v.tool_name ?? null,
+        shortcut: v.shortcut ?? null,
+      }));
+      const run = await invoke<SavedRun>("save_run_cmd", {
+        req: {
+          instruction: lastRunInstructionRef.current || instruction,
+          task_context: taskContext || null,
+          model,
+          steps: savedRunSteps,
+          total_cost_usd: totalCost,
+        },
+      });
+      pushLog(`saved run → ${run.run_id} (${run.total_steps} steps)`);
+      lastRunStepsRef.current = [];
+      setHasUnsavedRun(false);
+      await loadSavedRuns(true);
+      setSelectedRunId(run.run_id);
+    } catch (err) { pushLog(`save run error: ${String(err)}`); }
+  };
+
+  const replaySavedRun = async () => {
+    if (!selectedRunId) return;
+    const run = savedRuns.find((r) => r.run_id === selectedRunId);
+    if (!run) { pushLog("replay blocked: run not found"); return; }
+    replayStopRef.current = false;
+    focusModelActivity();
+    setBusy((b) => ({ ...b, replay: true }));
+    try {
+      pushLog(`replay started → ${run.name} (${run.total_steps} steps)`);
+      await replayRun({
+        steps: run.steps,
+        shouldStop: () => replayStopRef.current,
+        onStep: (step) => {
+          pushModelActivity(step);
+          void emit("agent_step", step).catch(() => undefined);
+        },
+        onCapture: setCapture,
+      });
+      pushLog("replay complete");
+      await refreshRuntime(true);
+    } catch (err) {
+      pushLog(`replay error: ${String(err)}`);
+      pushModelActivity({ phase: "error", step: 0, max_steps: 30, message: String(err) });
+    } finally {
+      setBusy((b) => ({ ...b, replay: false }));
+    }
+  };
+
+  const deleteSelectedRun = async () => {
+    if (!selectedRunId) return;
+    try {
+      await invoke("delete_saved_run_cmd", { runId: selectedRunId });
+      pushLog(`deleted run → ${selectedRunId}`);
+      setSelectedRunId(null);
+      await loadSavedRuns(true);
+    } catch (err) { pushLog(`delete run error: ${String(err)}`); }
+  };
+
   // ── Render ──────────────────────────────────────
 
   return (
-    <main className="app">
-      <div className="bg bg-a" />
-      <div className="bg bg-b" />
-
-      <header className="top card">
-        <div>
-          <h1>Computer Use</h1>
-          <p className="muted">OS-native vision automation with hotkey, terminal, and physical gestures.</p>
+    <div className="dashboard">
+      {/* ── Sidebar ─── */}
+      <aside className="dash-sidebar">
+        <div className="dash-sidebar-header">
+          <div className="dash-logo">
+            <span className="dash-logo-icon">⌘</span>
+            <div className="dash-logo-text">
+              <span className="dash-logo-name">Computer Use</span>
+              <span className="dash-logo-sub">v0.1.0</span>
+            </div>
+          </div>
         </div>
-        <div className="row" style={{ alignItems: "center", gap: "8px" }}>
+
+        <nav className="dash-nav">
+          <button className={`dash-nav-item ${tab === "run" ? "active" : ""}`} onClick={() => setTab("run")}>
+            <svg viewBox="0 0 24 24" className="dash-nav-icon"><polygon points="5,3 19,12 5,21" /></svg>
+            Run
+          </button>
+          <button className={`dash-nav-item ${tab === "activity" ? "active" : ""}`} onClick={() => setTab("activity")}>
+            <svg viewBox="0 0 24 24" className="dash-nav-icon"><polyline points="22,12 18,12 15,21 9,3 6,12 2,12" /></svg>
+            Activity
+          </button>
+          <button className={`dash-nav-item ${tab === "saved-runs" ? "active" : ""}`} onClick={() => setTab("saved-runs")}>
+            <svg viewBox="0 0 24 24" className="dash-nav-icon"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2z" /><path d="M17 21v-8H7v8" /><path d="M7 3v5h8" /></svg>
+            Saved Runs
+          </button>
+          <button className={`dash-nav-item ${tab === "shortcuts" ? "active" : ""}`} onClick={() => setTab("shortcuts")}>
+            <svg viewBox="0 0 24 24" className="dash-nav-icon"><rect x="2" y="4" width="20" height="16" rx="2" /><line x1="6" y1="8" x2="6" y2="8" /><line x1="10" y1="8" x2="10" y2="8" /><line x1="14" y1="8" x2="14" y2="8" /><line x1="18" y1="8" x2="18" y2="8" /><line x1="8" y1="16" x2="16" y2="16" /></svg>
+            Shortcuts
+          </button>
+          <button className={`dash-nav-item ${tab === "memory" ? "active" : ""}`} onClick={() => setTab("memory")}>
+            <svg viewBox="0 0 24 24" className="dash-nav-icon"><path d="M12 2a7 7 0 0 1 7 7c0 2.38-1.19 4.47-3 5.74V17a2 2 0 0 1-2 2H10a2 2 0 0 1-2-2v-2.26C6.19 13.47 5 11.38 5 9a7 7 0 0 1 7-7z" /><line x1="10" y1="22" x2="14" y2="22" /></svg>
+            Memory
+          </button>
+          <button className={`dash-nav-item ${tab === "dev" ? "active" : ""}`} onClick={() => setTab("dev")}>
+            <svg viewBox="0 0 24 24" className="dash-nav-icon"><circle cx="12" cy="12" r="3" /><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z" /></svg>
+            Settings
+          </button>
+        </nav>
+
+        <div className="dash-sidebar-footer">
           <select
             value={model}
             onChange={(e) => updateModel(e.target.value)}
-            style={{ fontSize: "0.75rem", padding: "5px 8px", background: "rgba(15,23,42,0.7)", color: "rgba(226,232,240,0.9)", border: "1px solid rgba(170,214,255,0.15)", borderRadius: "6px" }}
+            className="dash-model-select"
           >
             {MODEL_OPTIONS.map((m) => (
               <option key={m.id} value={m.id}>{m.label}</option>
             ))}
           </select>
-          <button onClick={() => setDarkMode((v) => !v)}>
-            {darkMode ? "Light Mode" : "Dark Mode"}
+          <button className="dash-nav-item" onClick={() => setDarkMode((v) => !v)}>
+            <svg viewBox="0 0 24 24" className="dash-nav-icon">
+              {darkMode
+                ? <><circle cx="12" cy="12" r="5" /><path d="M12 1v2" /><path d="M12 21v2" /><path d="M4.22 4.22l1.42 1.42" /><path d="M18.36 18.36l1.42 1.42" /><path d="M1 12h2" /><path d="M21 12h2" /><path d="M4.22 19.78l1.42-1.42" /><path d="M18.36 5.64l1.42-1.42" /></>
+                : <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z" />
+              }
+            </svg>
+            {darkMode ? "Light" : "Dark"}
           </button>
         </div>
-      </header>
+      </aside>
 
-      <nav className="tabs card">
-        <button className={tab === "run" ? "tab active" : "tab"} onClick={() => setTab("run")}>
-          Run
-        </button>
-        <button className={tab === "sessions" ? "tab active" : "tab"} onClick={() => setTab("sessions")}>
-          Sessions
-        </button>
-        <button className={tab === "dev" ? "tab active" : "tab"} onClick={() => setTab("dev")}>
-          Dev Tools
-        </button>
-      </nav>
-
-      <div className="main-grid">
-        <section className="stack">
+      {/* ── Content ─── */}
+      <main className="dash-content">
+        <div className="dash-content-inner">
           {tab === "run" && (
-            <RunTab
-              permsReady={health.permsReady}
-              keyReady={health.keyReady}
-              keyLabel={keyHealthLabel}
-              estopOn={health.estopOn}
-              overlayEnabled={overlayEnabled}
-              hudEnabled={hudEnabled}
-              modelActivity={modelActivity}
+            <>
+              <RunTab
+                permsReady={health.permsReady}
+                keyReady={health.keyReady}
+                keyLabel={keyHealthLabel}
+                estopOn={health.estopOn}
+                overlayEnabled={overlayEnabled}
+                hudEnabled={hudEnabled}
+                modelActivity={modelActivity}
+                runtime={runtime}
+                instruction={instruction}
+                setInstruction={setInstruction}
+                taskContext={taskContext}
+                setTaskContext={setTaskContext}
+                model={model}
+                updateModel={updateModel}
+                refreshPermissions={() => void refreshPermissions()}
+                requestPermissions={() => void requestPermissions()}
+                validateApiKey={() => void validateApiKey()}
+                refreshRuntime={() => void refreshRuntime()}
+                runLiveOnce={() => void runLiveOnce()}
+                runAgentLoop={() => { lastRunStepsRef.current = []; lastRunScreenshotsRef.current = []; setHasUnsavedRun(false); void runLoop(); }}
+                stopLoop={() => { loopStopRef.current = true; }}
+                setEstop={(v) => void setEstop(v)}
+                looping={looping}
+                busy={busy}
+              />
+              {hasUnsavedRun && !looping && (
+                <button onClick={() => void saveLastRun()} style={{ alignSelf: "flex-start" }}>
+                  💾 Save Run ({lastRunStepsRef.current.length} steps)
+                </button>
+              )}
+            </>
+          )}
+
+          {tab === "activity" && (
+            <>
+              {hasUnsavedRun && !looping && (
+                <div className="row" style={{ marginBottom: 8 }}>
+                  <button onClick={() => void saveLastRun()}>
+                    💾 Save Run ({lastRunStepsRef.current.length} steps)
+                  </button>
+                  {lastRunScreenshotsRef.current.length > 0 && (
+                    <button onClick={async () => {
+                      try {
+                        const dir = await invoke<string>("save_screenshots_cmd", { pngPaths: lastRunScreenshotsRef.current });
+                        pushLog(`Screenshots saved to ${dir}`);
+                      } catch (err) {
+                        pushLog(`Screenshot save failed: ${err}`);
+                      }
+                    }}>
+                      📸 Save Screenshots ({lastRunScreenshotsRef.current.length})
+                    </button>
+                  )}
+                </div>
+              )}
+              <ModelActivityPanel ref={modelActivityPanelRef} activity={modelActivity} pushLog={pushLog} />
+              <ActivityLogPanel log={log} />
+            </>
+          )}
+
+          {tab === "saved-runs" && (
+            <SavedRunsTab
+              savedRuns={savedRuns}
+              selectedRunId={selectedRunId}
+              setSelectedRunId={setSelectedRunId}
+              loadSavedRuns={() => void loadSavedRuns()}
+              replaySelectedRun={() => void replaySavedRun()}
+              stopReplay={() => { replayStopRef.current = true; }}
+              deleteSelectedRun={() => void deleteSelectedRun()}
+              busy={busy}
+            />
+          )}
+
+          {tab === "shortcuts" && <ShortcutsTab />}
+
+          {tab === "memory" && <MemoryTab />}
+
+          {tab === "dev" && (
+            <DevTab
+              permissions={permissions}
+              envStatus={envStatus}
               runtime={runtime}
-              instruction={instruction}
-              setInstruction={setInstruction}
-              taskContext={taskContext}
-              setTaskContext={setTaskContext}
-              model={model}
-              updateModel={updateModel}
+              recordingsRoot={recordingsRoot}
+              maxSteps={maxSteps}
+              setMaxSteps={setMaxSteps}
               refreshPermissions={() => void refreshPermissions()}
               requestPermissions={() => void requestPermissions()}
               validateApiKey={() => void validateApiKey()}
               refreshRuntime={() => void refreshRuntime()}
-              runLiveOnce={() => void runLiveOnce()}
-              runAgentLoop={() => void runLoop()}
-              stopLoop={() => { loopStopRef.current = true; }}
               setEstop={(v) => void setEstop(v)}
-              looping={looping}
-              busy={busy}
-            />
-          )}
-
-          {tab === "sessions" && (
-            <SessionsTab
-              recordingStatus={recordingStatus}
-              recordingSummary={recordingSummary}
-              sessions={sessions}
-              selectedSessionId={selectedSessionId}
-              instruction={instruction}
-              taskContext={taskContext}
-              model={model}
-              setSelectedSessionId={setSelectedSessionId}
-              setInstruction={setInstruction}
-              setTaskContext={setTaskContext}
-              updateModel={updateModel}
-              startRecording={() => void startRecording()}
-              stopRecording={() => void stopRecording()}
-              refreshRecordingStatus={() => void refreshRecordingStatus()}
-              loadSessions={() => void loadSessions()}
               openPath={(p) => void openPath(p)}
-              replaySelectedSession={() => void replaySelectedSession()}
-              stopReplay={() => { replayStopRef.current = true; }}
-              recordingsRoot={recordingsRoot}
-              busy={busy}
             />
           )}
-
-          {tab === "dev" && (
-            <DevTab
-              capture={capture}
-              vision={vision}
-              permissions={permissions}
-              envStatus={envStatus}
-              effectiveInstruction={effectiveInstruction}
-              recordingsRoot={recordingsRoot}
-              busy={busy}
-              capturePrimary={() => void capturePrimary()}
-              inferClick={() => void inferClick()}
-              executeClick={() => void executeClick()}
-            />
-          )}
-        </section>
-
-        <ModelActivityPanel ref={modelActivityPanelRef} activity={modelActivity} pushLog={pushLog} />
-        <ActivityLogPanel log={log} />
-      </div>
-    </main>
+        </div>
+      </main>
+    </div>
   );
 }
+

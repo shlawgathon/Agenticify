@@ -5,7 +5,7 @@ export const OVERLAY_QUERY_KEY = "overlay";
 export const HUD_LABEL = "hud";
 export const HUD_QUERY_KEY = "hud";
 export const MAIN_LABEL = "main";
-export const DEFAULT_HUD_MODEL = "mistralai/mistral-large-2512";
+export const DEFAULT_HUD_MODEL = "openai/gpt-5.4";
 
 export const MODEL_OPTIONS = [
   { id: "mistralai/mistral-large-2512", label: "Mistral Large 3" },
