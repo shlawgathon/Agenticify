@@ -10,7 +10,7 @@ Built with **Tauri 2** (Rust backend) + **React** (frontend). Runs natively on m
 
 ### Vision-First Agent Loop
 
-- Captures the screen, sends it to a vision model (Mistral API), and executes the model's decision — all in a tight loop.
+- Captures the screen, sends it to a vision model (via OpenRouter or direct API), and executes the model's decision — all in a tight loop.
 - The model now selects **named tools** instead of emitting raw action JSON. Core tools are `click_target`, `type_text`, `run_shell`, and `task_done`, plus a catalog of named shortcut tools such as `browser_new_tab` and `system_open_spotlight`.
 - Tool calls are still normalized into the internal action types **click**, **hotkey**, **type**, **shell**, and **none** for execution, telemetry, and session logs.
 - Step history is passed between iterations so the agent remembers what it already did.
@@ -49,8 +49,8 @@ Every inference call assembles a rich prompt from **7 distinct sources** — thi
 
 | Layer                         | Source                                                       | Injected Into               | Description                                                                                                                                                                                                                                                       |
 | ----------------------------- | ------------------------------------------------------------ | --------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **1. System Prompt**          | `vision.rs` (hardcoded)                                      | `system` message            | Tool-calling instructions, gating rules, Spotlight navigation rules, stopping criteria, text editing patterns, click accuracy heuristics, and shortcut-tool preference                                                                                             |
-| **2. Screenshot**             | `xcap` screen capture                                        | `user` message (image part) | PNG of the primary monitor, adaptively downscaled to `AGENT_INFER_MAX_DIM` (default 2048px). Encoded as base64 data URI                                                                                                                                           |
+| **1. System Prompt**          | `system_prompt.txt` (loaded via `include_str!`)              | `system` message            | 5-gate decision flow (objective → login detection → app check → last action → next action), tool-calling instructions, Spotlight rules, click accuracy heuristics, and shortcut-tool preference                                                                    |
+| **2. Screenshot**             | `CGWindowListCreateImage` (excludes HUD) / `xcap` fallback  | `user` message (image part) | PNG of the primary monitor with HUD/overlay excluded, adaptively downscaled to `AGENT_INFER_MAX_DIM` (default 2048px). Encoded as base64 data URI                                                                                                                 |
 | **3. Task Instruction**       | User input (HUD / dashboard)                                 | `user` message (text)       | The natural-language goal, e.g. "Open Chrome and go to github.com"                                                                                                                                                                                                |
 | **4. Coordinate System**      | Computed from screenshot dims                                | `user` message (text)       | Pixel coordinate bounds: `"The screenshot image is {W}x{H} pixels… (0,0) is top-left…"`                                                                                                                                                                           |
 | **5. OS Context**             | `gather_os_context()` via AppleScript                        | `user` message (text)       | **Frontmost app** name + **window title**, **running GUI apps** list, **open window names** in frontmost app, **app-specific state** (e.g. Spotify track, Chrome URL, Finder path — queried via per-app AppleScript with 2s kill timeout), **system time** (unix) |
@@ -73,7 +73,7 @@ Vision inference routes through **OpenRouter**, so you can switch models without
 
 - Model selection persists across sessions via `localStorage`.
 - Saved sessions remember which model was used and auto-select it on replay.
-- **Cost tracking** — each inference returns token usage and estimated USD cost. Totals are logged per run and per replay.
+- **Cost tracking** — each inference returns token usage and estimated USD cost via OpenRouter pricing API, with fallback to a built-in pricing table for known models (GPT-4o, Claude, Gemini, Mistral, Llama). Totals are logged per run and per replay.
 
 ### Shortcuts-First Navigation
 
@@ -84,7 +84,7 @@ The agent **always prefers keyboard shortcuts over clicking** — clicking is th
 - **System apps skipped** — loginwindow, Dock, SystemUIServer, and other system processes are automatically excluded.
 - **Static fallback** — the system prompt also includes a built-in catalog of named shortcut tools for browser, macOS, editing, and navigation actions.
 - **Priority order** — app-specific `app_*` tools → built-in shortcut tools → clicking (last resort).
-- **Wrong-app safety** — if the frontmost app is not the target app, the agent will **never click** (guaranteed wrong target). Instead it uses the `system_open_spotlight` tool, then `type_text`, then usually `press_return`.
+- **Wrong-app safety** — if the frontmost app is not the target app, the agent checks the Dock and installed native apps first (Linear, Slack, Notion, Discord, Spotify, etc.) before falling back to Spotlight. Prefers native macOS apps over browser-based alternatives.
 
 ### Tool Catalog
 
@@ -212,6 +212,13 @@ The backend now uses a single session recording implementation in `recording.rs`
 - Activity logs saved per session for post-run review
 - **Save Runs** — toggle in the command panel so every agent run automatically records as a replayable session
 
+### HUD-Excluded Screen Capture
+
+- Screen captures use **macOS `CGWindowListCreateImage`** with `kCGWindowListOptionOnScreenBelowWindow` to capture the entire desktop **excluding the HUD and overlay windows**.
+- The capture function finds the app's topmost window (highest z-layer) via `CGWindowListCopyWindowInfo` matching the process PID, then captures everything below it.
+- Falls back to `xcap` full-screen capture if the native API fails.
+- No more hiding/showing windows — zero flicker, clean captures every time.
+
 ### Transparent Overlay
 
 - Full-screen transparent window spanning all monitors.
@@ -310,13 +317,14 @@ The Rust backend is no longer a monolithic `main.rs`. `main.rs` is now the Tauri
 
 ```text
 src-tauri/src/
-├── main.rs         # app setup, shared helpers, command wiring
-├── models.rs       # shared request/response and runtime types
-├── vision.rs       # prompt assembly, screenshot preprocessing, tool registry and response parsing
-├── os_context.rs   # AppleScript-based app/window/system context
-├── recording.rs    # session recording, input capture, manifest/activity persistence
-├── shell.rs        # WhiteCircle validation and shell command execution
-└── shortcuts.rs    # app shortcut discovery and in-memory caching
+├── main.rs             # app setup, shared helpers, command wiring, CGWindowList capture
+├── models.rs           # shared request/response and runtime types
+├── vision.rs           # prompt assembly, screenshot preprocessing, tool registry, response parsing, cost estimation
+├── system_prompt.txt   # externalized system prompt (loaded via include_str!)
+├── os_context.rs       # AppleScript-based app/window/system context
+├── recording.rs        # session recording, input capture, manifest/activity persistence
+├── shell.rs            # WhiteCircle validation and shell command execution
+└── shortcuts.rs        # app shortcut discovery and in-memory caching
 ```
 
 This split matters for debugging: session issues stay in `recording.rs`, model/output issues stay in `vision.rs`, and macOS context problems stay in `os_context.rs` instead of being buried in one multi-thousand-line file.
@@ -379,16 +387,16 @@ session-<unix-ms>/
 
 ## Tech Stack
 
-| Layer               | Technology                                |
-| ------------------- | ----------------------------------------- |
-| Framework           | Tauri 2 (Rust + WebView)                  |
-| Frontend            | React + TypeScript + Vite                 |
-| Screen Capture      | `xcap`                                    |
-| Mouse Click         | `core-graphics` CGEvent (virtual cursor)  |
-| Keyboard Actuation  | `enigo`                                   |
-| Input Event Capture | `rdev` (global mouse/keyboard listener)   |
-| Vision Model        | Mistral API                               |
-| HTTP Client         | `reqwest`                                 |
+| Layer               | Technology                                                    |
+| ------------------- | ------------------------------------------------------------- |
+| Framework           | Tauri 2 (Rust + WebView)                                      |
+| Frontend            | React + TypeScript + Vite                                     |
+| Screen Capture      | `CGWindowListCreateImage` (HUD-excluded) / `xcap` (fallback)  |
+| Mouse Click         | `core-graphics` CGEvent (virtual cursor)                      |
+| Keyboard Actuation  | `enigo`                                                       |
+| Input Event Capture | `rdev` (global mouse/keyboard listener)                       |
+| Vision Model        | OpenRouter (any model) / direct API                           |
+| HTTP Client         | `reqwest`                                                     |
 | AI Guardrails       | WhiteCircle API (input/output protection) |
 | Styling             | Vanilla CSS with glassmorphism, dark mode |
 
@@ -397,8 +405,8 @@ session-<unix-ms>/
 Create `.env` in repo root:
 
 ```bash
-MISTRAL_API_KEY=YOUR_MISTRAL_API_KEY
-MISTRAL_API_BASE=https://api.mistral.ai/v1
+OPENROUTER_API_KEY=YOUR_OPENROUTER_API_KEY
+OPENROUTER_API_BASE=https://openrouter.ai/api/v1
 
 AGENT_CONFIDENCE_THRESHOLD=0.60
 AGENT_INFER_MAX_DIM=2048
@@ -426,7 +434,7 @@ Requires macOS with **Screen Recording** and **Accessibility** permissions (prom
 
 | Command                  | Description                                     |
 | ------------------------ | ----------------------------------------------- |
-| `capture_primary_cmd`    | Capture primary monitor screenshot              |
+| `capture_primary_cmd`    | Capture primary monitor screenshot (HUD-excluded via CGWindowList) |
 | `infer_click_cmd`        | Send screenshot + instruction to vision model and resolve one tool call |
 | `execute_real_click_cmd` | Perform CGEvent synthetic click at pixel coords |
 | `press_keys_cmd`         | Execute resolved shortcut key sequences         |
