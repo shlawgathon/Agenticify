@@ -26,6 +26,8 @@ rdev = "0.5"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 core-graphics = "0.24"
+core-foundation = "0.10"
+core-foundation-sys = "0.8"
 macos-accessibility-client = "0.0.2"
 objc2 = "0.6"
-objc2-app-kit = { version = "0.3", features = ["NSScreen"] }
+objc2-app-kit = { version = "0.3", features = ["NSScreen", "NSWindow"] }

@@ -5,6 +5,7 @@ mod os_context;
 mod recording;
 mod shell;
 mod shortcuts;
+mod memory;
 mod vision;
 
 #[allow(unused_imports)]
@@ -25,8 +26,8 @@ use tauri_plugin_global_shortcut::{Code, Modifiers, ShortcutState};
 use xcap::Monitor;
 
 const MAX_ACTIONS_PER_RUN: u32 = 30;
-const DEFAULT_MISTRAL_MODEL: &str = "mistralai/mistral-large-2512";
-const DEFAULT_MISTRAL_BASE: &str = "https://openrouter.ai/api/v1";
+const DEFAULT_MODEL: &str = "openai/gpt-5.4";
+const DEFAULT_API_BASE: &str = "https://openrouter.ai/api/v1";
 const DEFAULT_CONFIDENCE_THRESHOLD: f64 = 0.60;
 const DEFAULT_INFER_MAX_DIM: u32 = 2048;
 
@@ -272,7 +273,7 @@ pub(crate) fn resolve_primary_api_base() -> String {
                 .ok()
                 .filter(|v| !v.trim().is_empty())
         })
-        .unwrap_or_else(|| DEFAULT_MISTRAL_BASE.to_string())
+        .unwrap_or_else(|| DEFAULT_API_BASE.to_string())
 }
 
 pub(crate) fn resolve_primary_api_key() -> String {
@@ -440,6 +441,42 @@ fn export_markdown_cmd(filename: String, content: String) -> Result<String, Stri
 }
 
 #[tauri::command]
+fn save_screenshots_cmd(png_paths: Vec<String>) -> Result<String, String> {
+    if png_paths.is_empty() {
+        return Err("No screenshot paths provided".to_string());
+    }
+
+    let home = std::env::var("HOME").map_err(|_| "Cannot determine HOME".to_string())?;
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let out_dir = PathBuf::from(&home)
+        .join("Desktop")
+        .join(format!("computer-use-screenshots-{}", ts));
+    fs::create_dir_all(&out_dir).map_err(|e| e.to_string())?;
+
+    let mut saved = 0u32;
+    for (i, src_str) in png_paths.iter().enumerate() {
+        let src = PathBuf::from(src_str);
+        if src.exists() {
+            let dest = out_dir.join(format!("step-{:03}.png", i + 1));
+            fs::copy(&src, &dest).map_err(|e| e.to_string())?;
+            saved += 1;
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let _ = Command::new("open").arg(&out_dir).status();
+    }
+
+    let path_str = out_dir.to_string_lossy().to_string();
+    println!("[screenshots] saved {} of {} to {}", saved, png_paths.len(), path_str);
+    Ok(path_str)
+}
+
+#[tauri::command]
 fn get_runtime_state_cmd(guards: State<RuntimeGuards>) -> RuntimeState {
     RuntimeState {
         estop: guards.estop.load(Ordering::SeqCst),
@@ -460,6 +497,7 @@ fn set_estop_cmd(guards: State<RuntimeGuards>, enabled: bool) -> RuntimeState {
 
 #[tauri::command]
 async fn capture_primary_cmd(
+    _app: tauri::AppHandle,
     display_state: State<'_, DisplayState>,
 ) -> Result<CaptureFrame, String> {
     let startup_scale = *display_state
@@ -467,7 +505,20 @@ async fn capture_primary_cmd(
         .read()
         .map_err(|_| "Display scale lock poisoned".to_string())?;
 
-    tauri::async_runtime::spawn_blocking(move || {
+    // Get window IDs to exclude from capture (HUD + overlay).
+    // We find our own windows via CGWindowListCopyWindowInfo matching our PID,
+    // then use kCGWindowListOptionOnScreenBelowWindow with the topmost one.
+    let exclude_window_id: u32 = {
+        #[cfg(target_os = "macos")]
+        {
+            find_topmost_own_window().unwrap_or(0)
+        }
+        #[cfg(not(target_os = "macos"))]
+        { 0u32 }
+    };
+    println!("[capture] exclude_window_id={}", exclude_window_id);
+
+    let result = tauri::async_runtime::spawn_blocking(move || {
         let mut guard = None;
         for _ in 0..40 {
             match capture_mutex().try_lock() {
@@ -491,7 +542,17 @@ async fn capture_primary_cmd(
         let monitor_id = monitor.id().map_err(|e| e.to_string())?;
         let monitor_origin_x_pt = monitor.x().map_err(|e| e.to_string())?;
         let monitor_origin_y_pt = monitor.y().map_err(|e| e.to_string())?;
-        let screenshot = monitor.capture_image().map_err(|e| e.to_string())?;
+
+        // Capture screen excluding HUD/overlay via native macOS API
+        let screenshot = if exclude_window_id > 0 {
+            capture_screen_excluding_window(exclude_window_id)
+                .or_else(|e| {
+                    eprintln!("[capture] native capture failed ({}), falling back to xcap", e);
+                    monitor.capture_image().map_err(|e| e.to_string())
+                })?
+        } else {
+            monitor.capture_image().map_err(|e| e.to_string())?
+        };
 
         let screenshot_w_px = screenshot.width();
         let screenshot_h_px = screenshot.height();
@@ -514,8 +575,8 @@ async fn capture_primary_cmd(
 
         let capture_ms = started.elapsed().as_millis();
         println!(
-            "[telemetry] capture_ms={} monitor_id={} size={}x{} scale={}",
-            capture_ms, monitor_id, screenshot_w_px, screenshot_h_px, scale_factor
+            "[telemetry] capture_ms={} monitor_id={} size={}x{} scale={} exclude_win={}",
+            capture_ms, monitor_id, screenshot_w_px, screenshot_h_px, scale_factor, exclude_window_id
         );
 
         Ok(CaptureFrame {
@@ -530,7 +591,135 @@ async fn capture_primary_cmd(
         })
     })
     .await
-    .map_err(|e| format!("Capture task join error: {}", e))?
+    .map_err(|e| format!("Capture task join error: {}", e))?;
+
+    result
+}
+/// Find the topmost on-screen window belonging to our own process.
+/// Returns None if no windows are found.
+#[cfg(target_os = "macos")]
+fn find_topmost_own_window() -> Option<u32> {
+    use core_foundation::base::TCFType;
+    use core_graphics::window::{
+        kCGWindowListOptionOnScreenOnly, kCGWindowListExcludeDesktopElements,
+        kCGNullWindowID,
+    };
+
+    let our_pid = std::process::id() as i32;
+
+    // Get list of all on-screen windows
+    let window_list = unsafe {
+        core_graphics::window::CGWindowListCopyWindowInfo(
+            kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements,
+            kCGNullWindowID,
+        )
+    };
+    if window_list.is_null() {
+        return None;
+    }
+
+    let count = unsafe { core_foundation_sys::array::CFArrayGetCount(window_list) };
+
+    let mut best_id: u32 = 0;
+    let mut best_layer: i32 = -1;
+
+    for i in 0..count {
+        let dict = unsafe {
+            core_foundation_sys::array::CFArrayGetValueAtIndex(window_list, i)
+                as core_foundation_sys::dictionary::CFDictionaryRef
+        };
+        if dict.is_null() { continue; }
+
+        // Helper to read an i32 from a CFDictionary by CFString key
+        let read_i32 = |key_str: &str| -> i32 {
+            let key = core_foundation::string::CFString::new(key_str);
+            let mut val: *const std::ffi::c_void = std::ptr::null();
+            let found = unsafe {
+                core_foundation_sys::dictionary::CFDictionaryGetValueIfPresent(
+                    dict,
+                    key.as_CFTypeRef() as *const std::ffi::c_void,
+                    &mut val,
+                )
+            };
+            if found == 0 || val.is_null() { return 0; }
+            let mut out: i32 = 0;
+            unsafe {
+                core_foundation_sys::number::CFNumberGetValue(
+                    val as core_foundation_sys::number::CFNumberRef,
+                    core_foundation_sys::number::kCFNumberSInt32Type,
+                    &mut out as *mut i32 as *mut std::ffi::c_void,
+                );
+            }
+            out
+        };
+
+        let win_pid = read_i32("kCGWindowOwnerPID");
+        if win_pid != our_pid { continue; }
+
+        let win_id = read_i32("kCGWindowNumber") as u32;
+        let win_layer = read_i32("kCGWindowLayer");
+
+        println!("[capture] found own window: id={} layer={} pid={}", win_id, win_layer, win_pid);
+
+        // Pick the window with the highest layer (alwaysOnTop windows have layer > 0)
+        if win_layer > best_layer {
+            best_layer = win_layer;
+            best_id = win_id;
+        }
+    }
+
+    unsafe { core_foundation_sys::base::CFRelease(window_list as *const std::ffi::c_void) };
+
+    if best_id > 0 { Some(best_id) } else { None }
+}
+
+/// Capture the full screen excluding a specific window (by CGWindowID).
+/// Uses CGWindowListCreateImage with kCGWindowListOptionOnScreenBelowWindow.
+#[cfg(target_os = "macos")]
+fn capture_screen_excluding_window(exclude_window_id: u32) -> Result<image::RgbaImage, String> {
+    use core_graphics::display::{CGDisplay, CGRect, CGPoint, CGSize};
+    use core_graphics::window::{kCGWindowListOptionOnScreenBelowWindow, kCGWindowImageDefault};
+
+    let rect = CGRect {
+        origin: CGPoint { x: 0.0, y: 0.0 },
+        size: CGSize { width: 0.0, height: 0.0 }, // (0,0) = entire display
+    };
+
+    let cg_image = CGDisplay::screenshot(
+        rect,
+        kCGWindowListOptionOnScreenBelowWindow,
+        exclude_window_id,
+        kCGWindowImageDefault,
+    ).ok_or("CGWindowListCreateImage returned null")?;
+
+    let w = cg_image.width();
+    let h = cg_image.height();
+    let bytes_per_row = cg_image.bytes_per_row();
+    let raw_data = cg_image.data();
+    let buf: &[u8] = raw_data.bytes();
+
+    // CG returns BGRA; convert to RGBA
+    let mut rgba = Vec::with_capacity(w * h * 4);
+    for y in 0..h {
+        for x in 0..w {
+            let offset = y * bytes_per_row + x * 4;
+            if offset + 3 < buf.len() {
+                let b = buf[offset];
+                let g = buf[offset + 1];
+                let r = buf[offset + 2];
+                let a = buf[offset + 3];
+                rgba.push(r);
+                rgba.push(g);
+                rgba.push(b);
+                rgba.push(a);
+            } else {
+                rgba.extend_from_slice(&[0, 0, 0, 255]);
+            }
+        }
+    }
+
+    image::RgbaImage::from_raw(w as u32, h as u32, rgba)
+        .ok_or_else(|| "Failed to create RgbaImage from CG data".to_string())
 }
 
 #[tauri::command]
@@ -658,9 +847,31 @@ fn type_text_cmd(guards: State<RuntimeGuards>, text: String) -> Result<(), Strin
     }
 
     let mut enigo = Enigo::new(&Settings::default()).map_err(|e| e.to_string())?;
-    enigo.text(&text).map_err(|e| e.to_string())?;
 
-    println!("[keyboard] typed {} char(s)", text.len());
+    // Split on newlines; type each line in small chunks to prevent macOS dropping chars
+    let lines: Vec<&str> = text.split('\n').collect();
+    for (i, line) in lines.iter().enumerate() {
+        // Type this line in small chunks with delays
+        let chars: Vec<char> = line.chars().collect();
+        for chunk in chars.chunks(10) {
+            if guards.estop.load(Ordering::SeqCst) {
+                return Err("Emergency stop active".to_string());
+            }
+            let s: String = chunk.iter().collect();
+            enigo.text(&s).map_err(|e| e.to_string())?;
+            // Small delay between chunks to let macOS event queue keep up
+            std::thread::sleep(std::time::Duration::from_millis(12));
+        }
+        // Press Return for newlines (except after the last line)
+        if i < lines.len() - 1 {
+            enigo
+                .key(enigo::Key::Return, enigo::Direction::Click)
+                .map_err(|e| e.to_string())?;
+            std::thread::sleep(std::time::Duration::from_millis(30));
+        }
+    }
+
+    println!("[keyboard] typed {} char(s) (chunked)", text.len());
     Ok(())
 }
 
@@ -785,9 +996,21 @@ fn main() {
             recording::delete_session_cmd,
             recording::save_activity_log_cmd,
             recording::load_activity_log_cmd,
+            recording::save_run_cmd,
+            recording::list_saved_runs_cmd,
+            recording::load_saved_run_cmd,
+            recording::delete_saved_run_cmd,
+            recording::add_note_to_run_cmd,
             get_app_shortcuts_cmd,
             clear_shortcuts_cache_cmd,
+            shortcuts::list_all_cached_shortcuts_cmd,
+            shortcuts::delete_cached_shortcuts_cmd,
+            shortcuts::export_shortcuts_cmd,
+            memory::list_memories_cmd,
+            memory::add_memory_cmd,
+            memory::delete_memory_cmd,
             export_markdown_cmd,
+            save_screenshots_cmd,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri app");

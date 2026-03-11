@@ -710,6 +710,8 @@ name = "computer-use"
 version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
+ "core-foundation 0.10.1",
+ "core-foundation-sys 0.8.7",
  "core-graphics 0.24.0",
  "dirs",
  "dotenvy",
