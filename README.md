@@ -460,3 +460,7 @@ Requires macOS with **Screen Recording** and **Accessibility** permissions (prom
 | `get_runtime_state_cmd`     | Get runtime state (E-STOP, action count)          |
 | `get_app_shortcuts_cmd`     | Fetch/cache keyboard shortcuts for an app via LLM |
 | `clear_shortcuts_cache_cmd` | Clear the in-memory shortcuts cache               |
+
+---
+
+Prev. Agenticify.
