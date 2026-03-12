@@ -48,6 +48,12 @@ import { MemoryTab } from "./MemoryTab";
 import { DevTab } from "./DevTab";
 import { ModelActivityPanel, type ModelActivityPanelHandle } from "./ModelActivityPanel";
 import { ActivityLogPanel } from "./ActivityLogPanel";
+import { CommandPalette } from "./CommandPalette";
+import {
+  executeSlashCommand,
+  clearInstructionHistory,
+  type CommandContext,
+} from "../lib/commandSystem";
 
 export function MainApp() {
   const [tab, setTab] = useState<Tab>("run");
@@ -99,6 +105,8 @@ export function MainApp() {
 
   const [log, setLog] = useState<string[]>([]);
   const [modelActivity, setModelActivity] = useState<AgentStep[]>([]);
+  const [cmdPaletteOpen, setCmdPaletteOpen] = useState(false);
+  const [verboseMode, setVerboseMode] = useState(false);
   const modelActivityRef = useRef<HTMLDivElement>(null);
   const modelActivityPanelRef = useRef<ModelActivityPanelHandle>(null);
 
@@ -165,6 +173,33 @@ export function MainApp() {
   }, [envStatus?.mistral_api_key_loaded, apiAuth]);
 
   // ── Effects ──────────────────────────────────────
+
+  // ── Dashboard command context ──────────────────
+  const dashCommandCtx: CommandContext = {
+    clearActivity: () => { setModelActivity([]); setLog([]); },
+    resetSession: () => { setModelActivity([]); setLog([]); clearInstructionHistory(); },
+    toggleVerbose: () => setVerboseMode((v) => !v),
+    isVerbose: () => verboseMode,
+    showTokens: () => pushLog("Token usage: check Model Activity panel"),
+    showCost: () => pushLog("Cost: check Model Activity panel"),
+    switchModel: (id) => updateModel(id),
+    currentModel: () => model,
+    showHistory: () => pushLog("History: check HUD input (↑/↓ arrows)"),
+    pushActivity: (msg) => pushLog(msg),
+    modelOptions: MODEL_OPTIONS,
+  };
+
+  // ── ⌘K shortcut ───────────────────────────────
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && e.key === "k") {
+        e.preventDefault();
+        setCmdPaletteOpen((v) => !v);
+      }
+    };
+    window.addEventListener("keydown", handler);
+    return () => window.removeEventListener("keydown", handler);
+  }, []);
 
   useEffect(() => {
     document.documentElement.setAttribute("data-theme", darkMode ? "dark" : "light");
@@ -773,6 +808,7 @@ export function MainApp() {
           )}
         </div>
       </main>
+      <CommandPalette open={cmdPaletteOpen} onClose={() => setCmdPaletteOpen(false)} ctx={dashCommandCtx} />
     </div>
   );
 }

@@ -1,6 +1,7 @@
 // ── HudWindow — Floating Chat Bar (Pluely-inspired) ──────
 
 import { useEffect, useLayoutEffect, useRef, useState, useCallback } from "react";
+import { createPortal } from "react-dom";
 import { invoke } from "@tauri-apps/api/core";
 import { emit, listen } from "@tauri-apps/api/event";
 import { currentMonitor, getCurrentWindow, LogicalPosition, LogicalSize } from "@tauri-apps/api/window";
@@ -24,6 +25,18 @@ import {
 } from "../lib/tauri";
 import { runAgentLoop, summarizeRunCost } from "../lib/agentRunner";
 import type { VisionAction, SavedRun } from "../types";
+import {
+  executeSlashCommand,
+  filterCommands,
+  parseSlashCommand,
+  getInstructionHistory,
+  pushInstructionHistory,
+  clearInstructionHistory,
+  formatSessionStats,
+  type CommandContext,
+  type SessionStats,
+  type Command,
+} from "../lib/commandSystem";
 
 // ── Constants ─────────────────────────────────────
 const COLLAPSED_SIZE = 30;
@@ -58,6 +71,24 @@ export function HudWindow() {
   const [hasUnsavedRun, setHasUnsavedRun] = useState(false);
   const activityEndRef = useRef<HTMLDivElement>(null);
   const [windowBlurred, setWindowBlurred] = useState(false);
+
+  // ── Slash command state ───────────────────────
+  const [showCmdMenu, setShowCmdMenu] = useState(false);
+  const [cmdFilter, setCmdFilter] = useState<Command[]>([]);
+  const [cmdSelectedIdx, setCmdSelectedIdx] = useState(0);
+  const [verboseMode, setVerboseMode] = useState(false);
+
+  // ── Input history state ───────────────────────
+  const historyRef = useRef<string[]>(getInstructionHistory());
+  const [historyIdx, setHistoryIdx] = useState(-1);
+  const savedInputRef = useRef("");
+
+  // ── Session stats ─────────────────────────────
+  const [sessionStats, setSessionStats] = useState<SessionStats>({
+    totalSteps: 0,
+    totalTokens: 0,
+    totalCostUsd: 0,
+  });
 
   // Detect window focus/blur to compensate for macOS dropping backdrop-filter
   // and to restore correct window dimensions on focus return (e.g. after Spotlight)
@@ -351,9 +382,63 @@ export function HudWindow() {
     }
   };
 
+  // ── Command context (shared with commandSystem) ─
+  const commandCtx: CommandContext = {
+    clearActivity: () => setActivityFeed([]),
+    resetSession: () => {
+      setActivityFeed([]);
+      clearInstructionHistory();
+      historyRef.current = [];
+      setSessionStats({ totalSteps: 0, totalTokens: 0, totalCostUsd: 0 });
+    },
+    toggleVerbose: () => setVerboseMode((v) => !v),
+    isVerbose: () => verboseMode,
+    showTokens: () => {
+      pushActivity({
+        phase: "done", step: 0, max_steps: 0,
+        message: `Session tokens: ${sessionStats.totalTokens} total`,
+      });
+    },
+    showCost: () => {
+      pushActivity({
+        phase: "done", step: 0, max_steps: 0,
+        message: `Session cost: ~$${sessionStats.totalCostUsd.toFixed(6)}`,
+      });
+    },
+    switchModel: (id) => updateHudModel(id),
+    currentModel: () => hudModel,
+    showHistory: () => {
+      const hist = getInstructionHistory();
+      if (hist.length === 0) {
+        pushActivity({ phase: "done", step: 0, max_steps: 0, message: "No instruction history" });
+      } else {
+        const recent = hist.slice(-10).reverse().map((h, i) => `${i + 1}. ${h}`).join("\n");
+        pushActivity({ phase: "done", step: 0, max_steps: 0, message: `Recent instructions:\n${recent}` });
+      }
+    },
+    pushActivity: (msg) => {
+      pushActivity({ phase: "done", step: 0, max_steps: 0, message: msg });
+    },
+    modelOptions: MODEL_OPTIONS,
+  };
+
   // ── Agent loop from HUD ────────────────────────
   const runAgentLoopFromHud = async () => {
     if (!hudInstruction.trim()) return;
+
+    // Check for slash command
+    if (hudInstruction.startsWith("/")) {
+      executeSlashCommand(hudInstruction, commandCtx);
+      setHudInstruction("");
+      setShowCmdMenu(false);
+      return;
+    }
+
+    // Save to history
+    pushInstructionHistory(hudInstruction);
+    historyRef.current = getInstructionHistory();
+    setHistoryIdx(-1);
+
     loopStopRef.current = false;
     pausedRef.current = false;
     setPaused(false);
@@ -363,6 +448,7 @@ export function HudWindow() {
     loopingRef.current = true;
     setShowActivity(true);
     setRedirectInput("");
+    setSessionStats({ totalSteps: 0, totalTokens: 0, totalCostUsd: 0 });
 
     // Expand to show activity
     await setWindowSizeCentered(HUD_WIDTH, EXPANDED_H);
@@ -376,7 +462,17 @@ export function HudWindow() {
         shouldStop: () => loopStopRef.current,
         shouldPause: () => pausedRef.current,
         getInstruction: () => instructionRef.current,
-        onStep: pushActivity,
+        onStep: (step) => {
+          pushActivity(step);
+          // Update session stats
+          if (step.token_total || step.cost_usd) {
+            setSessionStats((prev) => ({
+              totalSteps: step.step || prev.totalSteps,
+              totalTokens: prev.totalTokens + (step.token_total ?? 0),
+              totalCostUsd: prev.totalCostUsd + (step.cost_usd ?? 0),
+            }));
+          }
+        },
         onVision: (v) => {
           if (v.action !== "none") lastRunStepsRef.current.push(v);
         },
@@ -574,25 +670,137 @@ export function HudWindow() {
                   {paused ? "⏸ " : ""}{hudInstruction.length > 50 ? `${hudInstruction.slice(0, 50)}…` : hudInstruction}
                 </div>
               ) : (
-                <input
-                  ref={inputRef}
-                  className="hud-chat-input"
-                  placeholder="Type instruction…"
-                  value={hudInstruction}
-                  onClick={focusInput}
-                  onChange={(e) => setHudInstruction(e.target.value)}
-                  onKeyDown={(e) => {
-                    if (e.key === "Enter" && !e.shiftKey && !looping) {
-                      e.preventDefault();
-                      void runAgentLoopFromHud();
-                    }
-                  }}
-                  autoComplete="off"
-                  spellCheck={false}
-                />
+                <div className="hud-input-wrap">
+                  <input
+                    ref={inputRef}
+                    className="hud-chat-input"
+                    placeholder="Type instruction or /command…"
+                    value={hudInstruction}
+                    onClick={focusInput}
+                    onChange={(e) => {
+                      const val = e.target.value;
+                      setHudInstruction(val);
+                      setHistoryIdx(-1);
+                      // Show/hide command menu
+                      if (val.startsWith("/")) {
+                        setCmdFilter(filterCommands(val));
+                        setCmdSelectedIdx(0);
+                        setShowCmdMenu(true);
+                      } else {
+                        setShowCmdMenu(false);
+                      }
+                    }}
+                    onKeyDown={(e) => {
+                      // Command menu navigation
+                      if (showCmdMenu && cmdFilter.length > 0) {
+                        if (e.key === "ArrowDown") {
+                          e.preventDefault();
+                          setCmdSelectedIdx((i) => Math.min(i + 1, cmdFilter.length - 1));
+                          return;
+                        }
+                        if (e.key === "ArrowUp") {
+                          e.preventDefault();
+                          setCmdSelectedIdx((i) => Math.max(i - 1, 0));
+                          return;
+                        }
+                        if (e.key === "Tab" || (e.key === "Enter" && !e.shiftKey)) {
+                          e.preventDefault();
+                          const cmd = cmdFilter[cmdSelectedIdx];
+                          if (cmd) {
+                            setHudInstruction(`/${cmd.id} `);
+                            if (e.key === "Enter") {
+                              executeSlashCommand(`/${cmd.id}`, commandCtx);
+                              setHudInstruction("");
+                              setShowCmdMenu(false);
+                            }
+                          }
+                          return;
+                        }
+                        if (e.key === "Escape") {
+                          e.preventDefault();
+                          setShowCmdMenu(false);
+                          return;
+                        }
+                      }
+
+                      // Input history (↑/↓ when not in command menu)
+                      if (!showCmdMenu && e.key === "ArrowUp") {
+                        e.preventDefault();
+                        const hist = historyRef.current;
+                        if (hist.length === 0) return;
+                        if (historyIdx === -1) savedInputRef.current = hudInstruction;
+                        const newIdx = historyIdx === -1 ? hist.length - 1 : Math.max(0, historyIdx - 1);
+                        setHistoryIdx(newIdx);
+                        setHudInstruction(hist[newIdx]);
+                        return;
+                      }
+                      if (!showCmdMenu && e.key === "ArrowDown") {
+                        e.preventDefault();
+                        const hist = historyRef.current;
+                        if (historyIdx === -1) return;
+                        const newIdx = historyIdx + 1;
+                        if (newIdx >= hist.length) {
+                          setHistoryIdx(-1);
+                          setHudInstruction(savedInputRef.current);
+                        } else {
+                          setHistoryIdx(newIdx);
+                          setHudInstruction(hist[newIdx]);
+                        }
+                        return;
+                      }
+
+                      // Submit
+                      if (e.key === "Enter" && !e.shiftKey && !looping) {
+                        e.preventDefault();
+                        void runAgentLoopFromHud();
+                      }
+                    }}
+                    autoComplete="off"
+                    spellCheck={false}
+                  />
+                  {/* ── Slash command autocomplete (portal to escape overflow:hidden) ─── */}
+                  {showCmdMenu && cmdFilter.length > 0 && createPortal(
+                    <div
+                      className="hud-cmd-menu"
+                      style={(() => {
+                        const rect = inputRef.current?.getBoundingClientRect();
+                        if (!rect) return {};
+                        return {
+                          top: rect.bottom + 4,
+                          left: rect.left,
+                          width: rect.width,
+                        };
+                      })()}
+                    >
+                      {cmdFilter.map((cmd, i) => (
+                        <button
+                          key={cmd.id}
+                          className={`hud-cmd-item ${i === cmdSelectedIdx ? "selected" : ""}`}
+                          onClick={() => {
+                            executeSlashCommand(`/${cmd.id}`, commandCtx);
+                            setHudInstruction("");
+                            setShowCmdMenu(false);
+                            inputRef.current?.focus();
+                          }}
+                          onMouseEnter={() => setCmdSelectedIdx(i)}
+                          type="button"
+                        >
+                          <span className="hud-cmd-id">/{cmd.id}</span>
+                          <span className="hud-cmd-desc">{cmd.description}</span>
+                        </button>
+                      ))}
+                    </div>,
+                    document.body,
+                  )}
+                </div>
               )}
 
               <div className="hud-right">
+                {looping && (
+                  <span className="hud-stats">
+                    {formatSessionStats(sessionStats)}
+                  </span>
+                )}
                 {looping && <ElapsedTimer active={looping} />}
                 <button className={`hud-btn hud-btn-icon ${showActivity ? "active" : ""}`} onClick={() => void toggleActivity()} title="Activity" type="button">
                   <svg viewBox="0 0 24 24" className="hud-icon"><path d="M6 9l6 6 6-6" /></svg>

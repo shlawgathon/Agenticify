@@ -1367,3 +1367,193 @@ code {
 .model-activity-item .activity-text strong {
   color: var(--text);
 }
+
+/* ── HUD Input Wrap (relative for autocomplete) ── */
+
+.hud-input-wrap {
+  flex: 1;
+  min-width: 0;
+  position: relative;
+}
+
+.hud-input-wrap .hud-chat-input {
+  width: 100%;
+}
+
+/* ── HUD Slash Command Autocomplete ────────── */
+
+.hud-cmd-menu {
+  position: fixed;
+  background: rgba(20, 20, 28, 0.96);
+  backdrop-filter: blur(24px) saturate(1.6);
+  -webkit-backdrop-filter: blur(24px) saturate(1.6);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 10px;
+  padding: 4px;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  max-height: 200px;
+  overflow-y: auto;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5);
+  z-index: 10000;
+}
+
+.hud-cmd-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 8px;
+  border-radius: 7px;
+  border: none;
+  background: transparent;
+  color: rgba(200, 200, 200, 0.85);
+  font-size: 0.54rem;
+  text-align: left;
+  cursor: pointer;
+  transition: background 100ms ease;
+}
+
+.hud-cmd-item.selected,
+.hud-cmd-item:hover {
+  background: rgba(90, 176, 255, 0.15);
+}
+
+.hud-cmd-id {
+  font-weight: 700;
+  color: rgba(140, 200, 255, 0.9);
+  white-space: nowrap;
+  min-width: 54px;
+}
+
+.hud-cmd-desc {
+  color: rgba(160, 160, 170, 0.7);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ── HUD Session Stats Badge ──────────────── */
+
+.hud-stats {
+  font-size: 0.46rem;
+  font-weight: 600;
+  color: rgba(160, 200, 255, 0.7);
+  white-space: nowrap;
+  padding: 2px 6px;
+  border-radius: 6px;
+  background: rgba(90, 176, 255, 0.08);
+  border: 1px solid rgba(90, 176, 255, 0.12);
+  font-variant-numeric: tabular-nums;
+}
+
+/* ── Command Palette (Dashboard ⌘K) ────────── */
+
+.cmd-palette-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 9999;
+  background: rgba(0, 0, 0, 0.5);
+  backdrop-filter: blur(4px);
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  padding-top: 18vh;
+}
+
+.cmd-palette {
+  width: 480px;
+  max-width: 90vw;
+  background: var(--card);
+  border: 1px solid var(--card-border);
+  border-radius: 14px;
+  box-shadow: 0 16px 64px rgba(0, 0, 0, 0.4);
+  overflow: hidden;
+  animation: palette-in 150ms ease-out;
+}
+
+@keyframes palette-in {
+  from { opacity: 0; transform: translateY(-8px) scale(0.97); }
+  to   { opacity: 1; transform: none; }
+}
+
+.cmd-palette-input-wrap {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 14px 16px;
+  border-bottom: 1px solid var(--card-border);
+}
+
+.cmd-palette-search-icon {
+  width: 16px;
+  height: 16px;
+  flex-shrink: 0;
+  fill: none;
+  stroke: var(--muted);
+  stroke-width: 2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.cmd-palette-input {
+  flex: 1;
+  border: none;
+  background: transparent;
+  color: var(--text);
+  font-family: var(--font-ui);
+  font-size: 0.95rem;
+  outline: none;
+}
+
+.cmd-palette-input::placeholder {
+  color: var(--muted);
+}
+
+.cmd-palette-list {
+  max-height: 320px;
+  overflow-y: auto;
+  padding: 6px;
+}
+
+.cmd-palette-empty {
+  text-align: center;
+  color: var(--muted);
+  font-size: 0.85rem;
+  padding: 24px 0;
+}
+
+.cmd-palette-item {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  width: 100%;
+  padding: 10px 12px;
+  border: none;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text);
+  font-size: 0.85rem;
+  text-align: left;
+  cursor: pointer;
+  transition: background 80ms ease;
+}
+
+.cmd-palette-item.selected,
+.cmd-palette-item:hover {
+  background: var(--accent-soft);
+}
+
+.cmd-palette-item-label {
+  font-weight: 700;
+  color: var(--accent);
+  white-space: nowrap;
+  min-width: 80px;
+}
+
+.cmd-palette-item-desc {
+  color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}

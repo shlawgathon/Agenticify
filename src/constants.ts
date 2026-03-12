@@ -7,6 +7,10 @@ export const HUD_QUERY_KEY = "hud";
 export const MAIN_LABEL = "main";
 export const DEFAULT_HUD_MODEL = "openai/gpt-5.4";
 
+/** Fast/cheap model for rote navigation steps (Spotlight typing, pressing Return, etc.).
+ *  Used by dynamic model selection to reduce cost on predictable steps. */
+export const FAST_MODEL = "qwen/qwen3.5-35b-a3b";
+
 export const MODEL_OPTIONS = [
   { id: "mistralai/mistral-large-2512", label: "Mistral Large 3" },
   { id: "qwen/qwen3.5-35b-a3b", label: "Qwen 3.5 35B A3B" },

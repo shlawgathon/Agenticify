@@ -349,6 +349,17 @@ pub(crate) fn gather_os_context_snapshot() -> OsContextSnapshot {
         if !app_state.is_empty() {
             parts.push(format!("App state ({}): {}", frontmost_app_name, app_state));
         }
+
+        // Inject real menu bar shortcuts for the frontmost app
+        match crate::menu_discovery::discover_menu_items_cmd(frontmost_app_name.clone()) {
+            crate::menu_discovery::MenuDiscoveryResult { items, error: None, .. } if !items.is_empty() => {
+                let menu_ctx = crate::menu_discovery::format_menu_context(&items);
+                if !menu_ctx.is_empty() {
+                    parts.push(format!("Available shortcuts ({}):\n{}", frontmost_app_name, menu_ctx));
+                }
+            }
+            _ => {} // Silently skip if discovery fails or returns empty
+        }
     }
 
     let human_date = Command::new("date")

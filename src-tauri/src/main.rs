@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod models;
+mod menu_discovery;
 mod os_context;
 mod recording;
 mod shell;
@@ -1011,6 +1012,7 @@ fn main() {
             memory::delete_memory_cmd,
             export_markdown_cmd,
             save_screenshots_cmd,
+            menu_discovery::discover_menu_items_cmd,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri app");
