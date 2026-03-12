@@ -471,4 +471,4 @@ Requires macOS with **Screen Recording** and **Accessibility** permissions (prom
 
 ---
 
-Prev. Agenticify.
+Prev. Agenticify. - kms after 14hrs of straight grind at this dumbahhh hackathon, nothign feels better than to coming back to doing homework after this L fml
